@@ -25,21 +25,21 @@ A recurring convention across all three: **"stage"** means *send instructions to
 ## Contents
 
 - [Prerequisites](#prerequisites)
-- [1. REPL image within a tmux session](#1-repl-image-within-a-tmux-session)
+- [1. REPL image within a tmux session](#1-repl-image-within-a-tmux-session-no-emacs)
 - [2. REPL image within a (WSL) session, accessed through (Windows) Emacs](#2-repl-image-within-a-wsl-session-accessed-through-windows-emacs)
 - [3. Emacs without tmux](#3-emacs-without-tmux)
 
-## 1. REPL image within a tmux session
+## 1. REPL image within a tmux session (no Emacs)
 
 Claude prompt:
 
 > Launch SBCL inside a detached tmux session named `lisp`.
+>
+> If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
+>
 > The user may be interacting with the lisp image through the REPL on its own, independently from you.
+>
 > In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
-
-To close the session, use this prompt:
-
-> Close the lisp tmux session
 
 Open the tmux session from a terminal:
 
@@ -49,12 +49,25 @@ tmux attach -t lisp
 
 Detach with `C-b d`.
 
-Examples of interaction prompts:
+Example 1 of interaction prompt:
 
-> Create a `foo` function which doubles its argument. Apply it to 45.
+> Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 15).
 
-> In `test.lisp`, create a `bar` function which squares its argument. Load it in the image and apply it to 11.
+![REPL interaction in a tmux SBCL session: foo defined, (foo 45) returns 90, and (foo 15) staged at the prompt](screenshots/screenshot_1_a.png)
 
+On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.
+
+Example 2 of interaction prompt:
+
+> In `test.lisp` file, create a `bar` function which squares its argument. Load it in the image and apply it to 11.
+
+![REPL interaction in a tmux SBCL session: test.lisp loaded (returns T), and (bar 11) returns 121](screenshots/screenshot_1_b.png)
+
+On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.
+
+To close the session, use this prompt:
+
+> Close the lisp tmux session
 
 ## 2. REPL image within a (WSL) session, accessed through (Windows) Emacs
 
