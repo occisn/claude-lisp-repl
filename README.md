@@ -14,6 +14,8 @@ Three transports are documented, from simplest to most integrated:
 
 A recurring convention across all three: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
+Any comment? Open an [issue](https://github.com/occisn/claude-lisp-repl/issues), or start a discussion [here](https://github.com/occisn/claude-lisp-repl/discussions) or [at profile level](https://github.com/occisn/occisn/discussions).
+
 ## Prerequisites
 
 - **SBCL** — the Lisp implementation driven in every recipe.
@@ -79,7 +81,7 @@ M-x server-start
 
 `(bound-and-true-p server-process)` then returns non-nil.
 
-** Step 2** - Claude prompt:
+**Step 2** - Claude prompt:
 
 > Launch SBCL inside a detached tmux session named `lisp`.
 > Typical instructions for the above:
