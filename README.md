@@ -61,7 +61,7 @@ Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 1
 
 ![REPL interaction in a tmux SBCL session: foo defined, (foo 45) returns 90, and (foo 15) staged at the prompt](screenshots/screenshot_1_a.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **Example 2 of interaction prompt:**
 
@@ -71,7 +71,7 @@ In `test.lisp` file, create a `bar` function which squares its argument. Load it
 
 ![REPL interaction in a tmux SBCL session: test.lisp loaded (returns T), and (bar 11) returns 121](screenshots/screenshot_1_b.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **To close the session**, use this prompt:
 
@@ -204,7 +204,7 @@ Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 1
 
 ![SLIME REPL: foo defined, (foo 45) returns 90, and (foo 15) staged at the CL-USER prompt](screenshots/screenshot_2_a.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **Example 2 of interaction prompt:**
 
@@ -220,7 +220,7 @@ In `test.lisp`, create a `bar` function which squares its argument. Load it in t
 
 ![SLIME REPL: test.lisp loaded (returns T), and (bar 11) returns 121 at the CL-USER prompt](screenshots/screenshot_2_b.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **Other examples of interaction prompt, involving systems:**
 
@@ -330,7 +330,7 @@ Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 1
 
 ![SLIME REPL: foo defined, (foo 45) returns 90, and (foo 15) staged at the CL-USER prompt](screenshots/screenshot_3_a.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **Example 2 of interaction prompt:**
 
@@ -346,7 +346,7 @@ In `test.lisp`, create a `bar` function which squares its argument. Load it in t
 
 ![SLIME REPL: test.lisp loaded from a Windows path (returns T), and (bar 11) returns 121 at the CL-USER prompt](screenshots/screenshot_3_b.png)
 
-*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
+*On the above picture, all interactions with REPL have been performed by Claude directly, with no manual input.*
 
 **Other examples of interaction prompts, related to systems:**
 
