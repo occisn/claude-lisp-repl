@@ -6,11 +6,11 @@ The image is long-lived and shared: you and Claude can both interact with it, in
 
 Three transports are documented, from simplest to most integrated:
 
-| # | Approach                                                                                      | REPL lives in           | You interact via      | Use when                                                           |
-|---|-----------------------------------------------------------------------------------------------|-------------------------|-----------------------|--------------------------------------------------------------------|
-| 1 | [tmux session](#1-repl-image-within-a-tmux-session)                                           | tmux (SBCL)             | tmux                  | You just want the simplest possible shared REPL, no Emacs.         |
-| 2 | [tmux image + Emacs/SLIME](#2-repl-image-within-a-wsl-session-accessed-through-windows-emacs) | WSL tmux (SBCL + swank) | Windows Emacs (SLIME) | You run SBCL in WSL but edit in Windows Emacs and want full SLIME. |
-| 3 | [Emacs/SLIME without tmux](#3-emacs-without-tmux)                                             | Emacs-launched SLIME    | Windows Emacs (SLIME) | Emacs manages the image itself; no separate tmux needed.           |
+| # | Approach                                                                                                           | REPL lives in           | You interact via      | Use when                                                           |
+|---|--------------------------------------------------------------------------------------------------------------------|-------------------------|-----------------------|--------------------------------------------------------------------|
+| 1 | [tmux session](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)         | tmux (SBCL)             | tmux                  | You just want the simplest possible shared REPL, no Emacs.         |
+| 2 | [tmux image + Emacs/SLIME](#2-claude-interacts-with-lisp-image-created-within-tmux-sessions-through-windows-emacs) | WSL tmux (SBCL + swank) | Windows Emacs (SLIME) | You run SBCL in WSL but edit in Windows Emacs and want full SLIME. |
+| 3 | [Emacs/SLIME without tmux](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)            | Emacs-launched SLIME    | Windows Emacs (SLIME) | Emacs manages the image itself; no separate tmux needed.           |
 
 A recurring convention across all three: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
@@ -25,13 +25,13 @@ A recurring convention across all three: **"stage"** means *send instructions to
 ## Contents
 
 - [Prerequisites](#prerequisites)
-- [1. REPL image within a tmux session](#1-repl-image-within-a-tmux-session-no-emacs)
-- [2. REPL image within a (WSL) session, accessed through (Windows) Emacs](#2-repl-image-within-a-wsl-session-accessed-through-windows-emacs)
-- [3. Emacs without tmux](#3-emacs-without-tmux)
+- [1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no emacs)](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)
+- [2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs](#2-claude-interacts-with-lisp-image-created-within-tmux-sessions-through-windows-emacs)
+- [3. Claude interacts with Lisp image created within Emacs through Emacs REPL](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)
 
-## 1. REPL image within a tmux session (no Emacs)
+## 1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no Emacs)
 
-Claude prompt:
+**Step 1** - Claude prompt:
 
 > Launch SBCL inside a detached tmux session named `lisp`.
 >
@@ -41,7 +41,7 @@ Claude prompt:
 >
 > In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
 
-Open the tmux session from a terminal:
+**Step 2** - Open the tmux session from a terminal:
 
 ```sh
 tmux attach -t lisp
@@ -49,29 +49,29 @@ tmux attach -t lisp
 
 Detach with `C-b d`.
 
-Example 1 of interaction prompt:
+**Example 1 of interaction prompt:**
 
 > Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 15).
 
 ![REPL interaction in a tmux SBCL session: foo defined, (foo 45) returns 90, and (foo 15) staged at the prompt](screenshots/screenshot_1_a.png)
 
-On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.
+*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
 
-Example 2 of interaction prompt:
+**Example 2 of interaction prompt:**
 
 > In `test.lisp` file, create a `bar` function which squares its argument. Load it in the image and apply it to 11.
 
 ![REPL interaction in a tmux SBCL session: test.lisp loaded (returns T), and (bar 11) returns 121](screenshots/screenshot_1_b.png)
 
-On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.
+*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
 
-To close the session, use this prompt:
+**To close the session**, use this prompt:
 
 > Close the lisp tmux session
 
-## 2. REPL image within a (WSL) session, accessed through (Windows) Emacs
+## 2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs
 
-Step 1: in Emacs, launch the server:
+**Step 1** - In Emacs, launch the server:
 
 ```elisp
 M-x server-start
@@ -79,7 +79,7 @@ M-x server-start
 
 `(bound-and-true-p server-process)` then returns non-nil.
 
-Step 2: Claude prompt:
+** Step 2** - Claude prompt:
 
 > Launch SBCL inside a detached tmux session named `lisp`.
 > Typical instructions for the above:
@@ -182,15 +182,21 @@ Step 2: Claude prompt:
 > ```
 
 
-Step 3: in Emacs: `M-x slime-connect RET 127.0.0.1 RET 4006 RET`
+**Step 3** - In Emacs: `M-x slime-connect RET 127.0.0.1 RET 4006 RET`
 
-Examples of interaction prompts:
+**Example 1 of interaction prompt:**
 
-> Create a `foo` function which doubles its argument. Apply it to 45.
+> Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 15).
+
+**Example 2 of interaction prompt:**
 
 > I have executed a command in the Lisp REPL within Emacs. Do you see it? What was the result?
 
+**Example 3 of interaction prompt:**
+
 > In `test.lisp`, create a `bar` function which squares its argument. Load it in the image and apply it to 11.
+
+**Other examples of interaction prompt, involving systems:**
 
 > Force load cl-abc system and launch main function
 
@@ -198,9 +204,9 @@ Examples of interaction prompts:
 
 > Launch system tests
 
-Note: you can obviously use Emacs commands to modify and compile sections of code, for instance `C-c C-c`.
+**Note:** you can obviously use Emacs commands to modify and compile sections of code, for instance `C-c C-c`.
 
-Note: even if the purpose of this section is to work through the Emacs REPL, you can still reach the tmux REPL via
+**Note:** even if the purpose of this section is to work through the Emacs REPL, you can still reach the tmux REPL via
 
 ```sh
 tmux attach -t lisp
@@ -208,7 +214,7 @@ tmux attach -t lisp
 
 and detach with `C-b d`.
 
-## 3. Emacs without tmux
+## 3. Claude interacts with Lisp image created within Emacs through Emacs REPL
 
 Step 1: in Emacs: `M-x server-start`.
 
