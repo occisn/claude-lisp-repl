@@ -325,8 +325,12 @@ visible REPL input and lands in the SLIME history."
 **Example 1 of interaction prompt:**
 
 ```
-Create a `foo` function which doubles its argument. Apply it to 45.
+Create a `foo` function which doubles its argument. Apply it to 45. Stage (foo 15).
 ```
+
+![SLIME REPL: foo defined, (foo 45) returns 90, and (foo 15) staged at the CL-USER prompt](screenshots/screenshot_3_a.png)
+
+*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
 
 **Example 2 of interaction prompt:**
 
@@ -339,6 +343,10 @@ I have executed a command in the Lisp REPL within Emacs. Do you see it? What was
 ```
 In `test.lisp`, create a `bar` function which squares its argument. Load it in the image and apply it to 11.
 ```
+
+![SLIME REPL: test.lisp loaded from a Windows path (returns T), and (bar 11) returns 121 at the CL-USER prompt](screenshots/screenshot_3_b.png)
+
+*On the above picture, all interaction with REPL have been performed by Claude directly, with no manual input.*
 
 **Other examples of interaction prompts, related to systems:**
 
