@@ -6,11 +6,11 @@ The image is long-lived and shared: you and Claude can both interact with it, in
 
 Three transports are documented, from simplest to most integrated:
 
-| # | Approach                                                                                                           | REPL lives in           | You interact via      | Use when                                                           |
-|---|--------------------------------------------------------------------------------------------------------------------|-------------------------|-----------------------|--------------------------------------------------------------------|
-| 1 | [tmux session](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)         | tmux (SBCL)             | tmux                  | You just want the simplest possible shared REPL, no Emacs.         |
-| 2 | [tmux image + Emacs/SLIME](#2-claude-interacts-with-lisp-image-created-within-tmux-sessions-through-windows-emacs) | WSL tmux (SBCL + swank) | Windows Emacs (SLIME) | You run SBCL in WSL but edit in Windows Emacs and want full SLIME. |
-| 3 | [Emacs/SLIME without tmux](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)            | Emacs-launched SLIME    | Windows Emacs (SLIME) | Emacs manages the image itself; no separate tmux needed.           |
+| # | Approach                                                                                                          | REPL lives in           | You interact via      | Use when                                                           |
+|---|-------------------------------------------------------------------------------------------------------------------|-------------------------|-----------------------|--------------------------------------------------------------------|
+| 1 | [tmux session](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)        | tmux (SBCL)             | tmux                  | You just want the simplest possible shared REPL, no Emacs.         |
+| 2 | [tmux image + Emacs/SLIME](#2-claude-interacts-with-lisp-image-created-within-tmux-session-through-windows-emacs) | WSL tmux (SBCL + swank) | Windows Emacs (SLIME) | You run SBCL in WSL but edit in Windows Emacs and want full SLIME. |
+| 3 | [Emacs/SLIME without tmux](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)           | Emacs-launched SLIME    | Windows Emacs (SLIME) | Emacs manages the image itself; no separate tmux needed.           |
 
 A recurring convention across all three: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
@@ -26,7 +26,7 @@ A recurring convention across all three: **"stage"** means *send instructions to
 
 - [Prerequisites](#prerequisites)
 - [1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no emacs)](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)
-- [2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs](#2-claude-interacts-with-lisp-image-created-within-tmux-sessions-through-windows-emacs)
+- [2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs](#2-claude-interacts-with-lisp-image-created-within-tmux-session-through-windows-emacs)
 - [3. Claude interacts with Lisp image created within Emacs through Emacs REPL](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)
 
 ## 1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no Emacs)
