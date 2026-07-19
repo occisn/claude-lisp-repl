@@ -41,6 +41,11 @@ Approaches 2 and 3 also use [`slime-bridge.el`](slime-bridge.el) from this repos
 [`slime-bridge.el`](slime-bridge.el) provides the elisp used by approaches 2 and
 3. Load it once per Emacs session via `emacsclient`; it needs SLIME connected.
 
+Everything is in that one file — there is no second copy to drift out of sync
+— so you can either have Claude `load-file` it as shown in each recipe, or
+simply paste its contents at the end of the prompt you give Claude if you
+would rather keep the prompt self-contained.
+
 ```elisp
 (my/slime-stage "(foo 1)")            ; insert at the prompt, do NOT press RET
 (my/slime-send  "(foo 1)")            ; insert and submit; returns "sent"
@@ -133,6 +138,8 @@ M-x server-start
 `(bound-and-true-p server-process)` then returns non-nil.
 
 **Step 2** - Claude prompt:
+
+*(The helper functions are in a single file, [`slime-bridge.el`](slime-bridge.el) — let Claude load it, or paste its contents at the end of this prompt.)*
 
 ````
 Launch SBCL inside a detached tmux session named `lisp`.
@@ -273,6 +280,8 @@ and detach with `C-b d`.
 **Step 1** - In Emacs: `M-x server-start`.
 
 **Step 2** - Claude prompt:
+
+*(The helper functions are in a single file, [`slime-bridge.el`](slime-bridge.el) — let Claude load it, or paste its contents at the end of this prompt.)*
 
 ````
 Emacs is running in a Windows environment and `server-start` has been launched. You may need to use `emacsclient.exe` to interact with it.
