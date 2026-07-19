@@ -14,6 +14,8 @@ Three transports are documented, from simplest to most integrated:
 
 A recurring convention across all three: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
+Approaches 2 and 3 share one set of elisp helpers, [`slime-bridge.el`](slime-bridge.el), covering staging, submitting, waiting for the prompt, and reading output back — see [Helper functions](#helper-functions).
+
 Any comment? Open an [issue](https://github.com/occisn/claude-lisp-repl/issues), or start a discussion [here](https://github.com/occisn/claude-lisp-repl/discussions) or [at profile level](https://github.com/occisn/occisn/discussions).
 
 ## Prerequisites
@@ -24,12 +26,53 @@ Any comment? Open an [issue](https://github.com/occisn/claude-lisp-repl/issues),
 - **Emacs with SLIME** — approaches 2 and 3.
 - **WSL + Windows Emacs** — approach 2 specifically assumes SBCL in WSL (Linux) and Emacs on Windows. Adjust the `emacsclient.exe` path below to your install.
 
+Approaches 2 and 3 also use [`slime-bridge.el`](slime-bridge.el) from this repository; see [Helper functions](#helper-functions).
+
 ## Contents
 
 - [Prerequisites](#prerequisites)
+- [Helper functions](#helper-functions)
 - [1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no emacs)](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)
 - [2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs](#2-claude-interacts-with-lisp-image-created-within-tmux-session-through-windows-emacs)
 - [3. Claude interacts with Lisp image created within Emacs through Emacs REPL](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)
+
+## Helper functions
+
+[`slime-bridge.el`](slime-bridge.el) provides the elisp used by approaches 2 and
+3. Load it once per Emacs session via `emacsclient`; it needs SLIME connected.
+
+```elisp
+(my/slime-stage "(foo 1)")            ; insert at the prompt, do NOT press RET
+(my/slime-send  "(foo 1)")            ; insert and submit; returns "sent"
+(my/slime-send-wait "(foo 1)" 30)     ; submit, wait for the prompt, return the output
+(my/slime-repl-status)                ; connected? busy? visible? pending input?
+```
+
+For anything slow — `(ql:quickload ...)`, a test suite — use the non-blocking
+sequence instead, which keeps Emacs responsive because every call returns at
+once and the shell does the waiting:
+
+```elisp
+(my/slime-mark)                       ; remember where output starts
+(my/slime-send "(ql:quickload :my-system)")
+(my/slime-busy-p)                     ; poll this from the shell, sleeping there
+(my/slime-output-since-mark 2000)     ; collect the result
+```
+
+Three things the file is careful about, each learned the hard way:
+
+- **`slime-output-buffer` signals when nothing is connected**, it does not return
+  nil. Guarding with `(and (fboundp 'slime-output-buffer) (slime-output-buffer))`
+  therefore never yields a friendly message — you get a raw SLIME error. Check
+  `slime-connected-p` first.
+- **`slime-repl-kill-input` kills "from the prompt to point"**, so staging after
+  `(goto-char (point-max))` silently discards whatever the user was half-way
+  through typing. It lands in the kill ring, but nothing says so. `my/slime-stage`
+  refuses to overwrite unsent input unless you pass FORCE — which matters
+  precisely because the premise here is that the user is using the image too.
+- **The REPL is never forced into the user's window.** It is surfaced only when
+  it is not already visible in some window on some frame (`0` = all frames,
+  including iconified ones).
 
 ## 1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no Emacs)
 
@@ -146,51 +189,30 @@ I want all your interactions (stage, execute, load, etc.) with the image to go t
 
 I do not want you to force the REPL buffer onto whatever buffer the user is working on in Emacs. First check if the buffer is open somewhere in a frame or window.
 
-The helper functions below may help. They need SLIME to be connected. Load them in the running Emacs via emacsclient if you find them useful. If you find better variants, tell me so I can improve this prompt.
+Helper functions for staging, sending, waiting for the prompt and reading output
+back are in [`slime-bridge.el`](slime-bridge.el) of this repository. Load them in
+the running Emacs (Windows path namespace if Emacs is a Windows process, even
+when you call it from WSL):
 
-```elisp
-(defun my/slime-stage (code)
-  "Insert CODE as pending input at the SLIME REPL prompt, WITHOUT sending it.
-The user reviews/tweaks and presses RET to evaluate."
-  (let ((buf (and (fboundp 'slime-output-buffer) (slime-output-buffer))))
-    (unless buf (user-error "No SLIME REPL buffer; is SLIME connected?"))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (when (fboundp 'slime-repl-kill-input) (slime-repl-kill-input)) ; clear half-typed input
-      (insert code))
-    ;; Only surface the REPL if it isn't already shown in any window on any
-    ;; frame (0 = all frames, including iconified/minimized); otherwise leave
-    ;; the user's current window untouched.
-    (unless (get-buffer-window buf 0)
-      (display-buffer buf))
-    "staged"))
-
-(defun my/slime-send (code)
-  (my/slime-stage code)                    ; clears prompt, inserts CODE
-  (let ((buf (slime-output-buffer)))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (slime-repl-return)))                ; presses RET → submits to REPL
-  "sent")
-
-(defun my/slime-stage-file (path)
-  "Read PATH and stage its (trimmed) contents into the SLIME REPL prompt."
-  (my/slime-stage
-   (with-temp-buffer
-     (insert-file-contents path)
-     (string-trim (buffer-string)))))
-
-(defun my/slime-send-file (path)
-  "Read PATH, stage its contents at the SLIME REPL prompt, then SUBMIT (execute) it.
-Like `my/slime-stage-file' but also presses RET for you, so the form runs as
-visible REPL input and lands in the SLIME history."
-  (my/slime-stage-file path)            ; guards: errors early if SLIME not connected
-  (let ((buf (slime-output-buffer)))    ; safe to call now — connection is established
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (slime-repl-return)))
-  "sent")
+```sh
+emacsclient --eval '(load-file "/path/to/claude-lisp-repl/slime-bridge.el")'
 ```
+
+Then:
+
+| Need | Call |
+|------|------|
+| stage without evaluating | `(my/slime-stage "FORM")` |
+| submit | `(my/slime-send "FORM")` |
+| submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
+| slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| where am I | `(my/slime-repl-status)` |
+
+Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
+which queues the user's keystrokes and makes Emacs feel frozen until the form
+finishes. Poll from the shell instead, so the sleeping happens outside Emacs.
+
+If you find better variants, tell me so I can improve this prompt.
 ````
 
 
@@ -271,55 +293,34 @@ In our future interactions, "stage" instructions would mean send instructions to
 
 I want all your interactions (stage, execute, load, etc.) with the image to go through the Emacs REPL.
 
-The image is Windows SBCL (Win32), so file loading within the image requires the Windows path namespace.
+Emacs **and** the image are Windows processes here, while your shell is WSL, so the same file has two spellings: paths sent to Emacs (`load-file`) or into the image (`load`, `asdf`) must be Windows form (`C:/...`); paths used by your own shell tools must be WSL form (`/mnt/c/...`). Note this is the mirror image of approach 2, where the image runs in WSL.
 
 I do not want you to force the REPL buffer onto whatever buffer the user is working on in Emacs. First check if the buffer is open somewhere in a frame or window.
 
-The helper functions below may help. They need SLIME to be connected. Load them in the running Emacs via emacsclient if you find them useful. If you find better variants, tell me so I can improve this prompt.
+Helper functions for staging, sending, waiting for the prompt and reading output
+back are in [`slime-bridge.el`](slime-bridge.el) of this repository. Load them in
+the running Emacs (Windows path namespace if Emacs is a Windows process, even
+when you call it from WSL):
 
-```elisp
-(defun my/slime-stage (code)
-  "Insert CODE as pending input at the SLIME REPL prompt, WITHOUT sending it.
-The user reviews/tweaks and presses RET to evaluate."
-  (let ((buf (and (fboundp 'slime-output-buffer) (slime-output-buffer))))
-    (unless buf (user-error "No SLIME REPL buffer; is SLIME connected?"))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (when (fboundp 'slime-repl-kill-input) (slime-repl-kill-input)) ; clear half-typed input
-      (insert code))
-    ;; Only surface the REPL if it isn't already shown in any window on any
-    ;; frame (0 = all frames, including iconified/minimized); otherwise leave
-    ;; the user's current window untouched.
-    (unless (get-buffer-window buf 0)
-      (display-buffer buf))
-    "staged"))
-
-(defun my/slime-send (code)
-  (my/slime-stage code)                    ; clears prompt, inserts CODE
-  (let ((buf (slime-output-buffer)))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (slime-repl-return)))                ; presses RET → submits to REPL
-  "sent")
-
-(defun my/slime-stage-file (path)
-  "Read PATH and stage its (trimmed) contents into the SLIME REPL prompt."
-  (my/slime-stage
-   (with-temp-buffer
-     (insert-file-contents path)
-     (string-trim (buffer-string)))))
-
-(defun my/slime-send-file (path)
-  "Read PATH, stage its contents at the SLIME REPL prompt, then SUBMIT (execute) it.
-Like `my/slime-stage-file' but also presses RET for you, so the form runs as
-visible REPL input and lands in the SLIME history."
-  (my/slime-stage-file path)            ; guards: errors early if SLIME not connected
-  (let ((buf (slime-output-buffer)))    ; safe to call now — connection is established
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (slime-repl-return)))
-  "sent")
+```sh
+emacsclient --eval '(load-file "/path/to/claude-lisp-repl/slime-bridge.el")'
 ```
+
+Then:
+
+| Need | Call |
+|------|------|
+| stage without evaluating | `(my/slime-stage "FORM")` |
+| submit | `(my/slime-send "FORM")` |
+| submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
+| slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| where am I | `(my/slime-repl-status)` |
+
+Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
+which queues the user's keystrokes and makes Emacs feel frozen until the form
+finishes. Poll from the shell instead, so the sleeping happens outside Emacs.
+
+If you find better variants, tell me so I can improve this prompt.
 ````
 
 **Example 1 of interaction prompt:**
