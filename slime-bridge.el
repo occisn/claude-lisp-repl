@@ -23,6 +23,11 @@
 ;;     unsent input at the prompt unless explicitly forced.
 ;;   * Everything lands as real REPL input, so it appears in the user's history
 ;;     and scrollback exactly as if they had typed it.
+;;
+;; Usage convention (see the README prompts): stage or send, then report and
+;; stop.  The user is watching the REPL, so reading results back is wasted
+;; effort unless they ask for them.  `my/slime-busy-p' before sending a NEW
+;; form is the exception -- a precondition check, not result analysis.
 
 ;;; Code:
 
