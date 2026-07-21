@@ -117,9 +117,27 @@ The forms run as visible REPL input and land in the SLIME history."
 ;;; ---------------------------------------------------------------------------
 
 (defun my/slime-busy-p ()
-  "Non-nil while the Lisp is still working on something."
+  "Return t while the Lisp is still working on something, nil otherwise.
+
+Deliberately coerced to a strict boolean.  The documented workflow polls this
+from the shell via `emacsclient --eval', which PRINTS the value, and SLIME's own
+`slime-busy-p' returns the list of pending continuations rather than t/nil.  A
+shell test like [ \"$x\" = \"nil\" ] would then never match and the caller would
+poll forever."
   (and (fboundp 'slime-busy-p)
-       (ignore-errors (slime-busy-p))))
+       (not (null (ignore-errors (slime-busy-p))))))
+
+(defun my/slime-interrupt ()
+  "Interrupt the running evaluation -- the shell-side equivalent of C-c C-c.
+
+Lets a caller stop a runaway form it started itself, without touching whatever
+window the user is looking at.  Returns \"interrupted\" if a request was sent,
+\"idle\" if nothing was running."
+  (if (my/slime-busy-p)
+      (progn (my/slime-assert-connected)
+             (slime-interrupt)
+             "interrupted")
+    "idle"))
 
 (defun my/slime-repl-tail (&optional n-chars)
   "Return the last N-CHARS characters of the SLIME REPL buffer (default 2000)."
@@ -191,6 +209,27 @@ slow use the mark/send/poll/read sequence below instead."
         (if (and max-chars (> (length text) max-chars))
             (concat "...[truncated]...\n" (substring text (- (length text) max-chars)))
           text)))))
+
+;;; --- Output to a file ------------------------------------------------------
+;;;
+;;; `emacsclient --eval' prints its result as an Elisp string literal: newlines
+;;; come back as \n escapes, non-ASCII is mangled, and long strings can make
+;;; emacsclient emit "*ERROR*: Unknown message:" mid-stream.  Writing to a file
+;;; side-steps the printer entirely, so the shell can just read plain UTF-8.
+
+(defun my/slime-write-string-to-file (string path)
+  "Write STRING to PATH as UTF-8 with Unix line endings.  Return PATH."
+  (let ((coding-system-for-write 'utf-8-unix))
+    (with-temp-file path (insert string)))
+  path)
+
+(defun my/slime-output-since-mark-to-file (path &optional max-chars)
+  "Write `my/slime-output-since-mark' to PATH as UTF-8.  Return PATH."
+  (my/slime-write-string-to-file (my/slime-output-since-mark max-chars) path))
+
+(defun my/slime-repl-tail-to-file (path &optional n-chars)
+  "Write `my/slime-repl-tail' to PATH as UTF-8.  Return PATH."
+  (my/slime-write-string-to-file (my/slime-repl-tail n-chars) path))
 
 (defun my/slime-repl-status ()
   "One-call summary: connection, REPL buffer, package, busy state, prompt tail."

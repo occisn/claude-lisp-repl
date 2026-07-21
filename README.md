@@ -62,14 +62,25 @@ once and the shell does the waiting:
 (my/slime-send "(ql:quickload :my-system)")
 (my/slime-busy-p)                     ; poll this from the shell, sleeping there
 (my/slime-output-since-mark 2000)     ; collect the result
+
+;; …or, to avoid emacsclient's string escaping entirely:
+(my/slime-output-since-mark-to-file "/tmp/out.txt")   ; then just cat it
+(my/slime-interrupt)                  ; stop a runaway form you started
 ```
 
-Three things the file is careful about, each learned the hard way:
+Four things the file is careful about, each learned the hard way:
 
 - **`slime-output-buffer` signals when nothing is connected**, it does not return
   nil. Guarding with `(and (fboundp 'slime-output-buffer) (slime-output-buffer))`
   therefore never yields a friendly message — you get a raw SLIME error. Check
   `slime-connected-p` first.
+
+- **`my/slime-busy-p` must print as `t` or `nil`.** SLIME's own `slime-busy-p`
+  returns the *list* of pending continuations, not a boolean, so a helper that
+  passes it through prints something like `((8 . #[(G369) …]))` when called
+  through `emacsclient --eval`. A shell poll testing `= "nil"` then never
+  matches and the caller waits forever — which is exactly what the workflow
+  above tells it to do. The helper coerces to a strict boolean for this reason.
 - **`slime-repl-kill-input` kills "from the prompt to point"**, so staging after
   `(goto-char (point-max))` silently discards whatever the user was half-way
   through typing. It lands in the kill ring, but nothing says so. `my/slime-stage`
@@ -217,11 +228,20 @@ Then:
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
+| stop a runaway form | `(my/slime-interrupt)` |
 | where am I | `(my/slime-repl-status)` |
 
 Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
 which queues the user's keystrokes and makes Emacs feel frozen until the form
 finishes. Poll from the shell instead, so the sleeping happens outside Emacs.
+
+Expect slow to look like stuck. Touching a file near the root of a `:serial t`
+ASDF system makes every downstream file recompile, so a `test-system` can sit
+silent for many minutes and be perfectly healthy. Judge by whether
+`(my/slime-repl-status)`'s `:tail` is *moving*, not by elapsed time — and if it
+really is wedged, `(my/slime-interrupt)` ends it without touching the user's
+window.
 
 In day-to-day use you will reach for `my/slime-stage` and `my/slime-send` far
 more than the reading helpers: the user is watching the REPL, so the default is
@@ -335,11 +355,20 @@ Then:
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
+| stop a runaway form | `(my/slime-interrupt)` |
 | where am I | `(my/slime-repl-status)` |
 
 Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
 which queues the user's keystrokes and makes Emacs feel frozen until the form
 finishes. Poll from the shell instead, so the sleeping happens outside Emacs.
+
+Expect slow to look like stuck. Touching a file near the root of a `:serial t`
+ASDF system makes every downstream file recompile, so a `test-system` can sit
+silent for many minutes and be perfectly healthy. Judge by whether
+`(my/slime-repl-status)`'s `:tail` is *moving*, not by elapsed time — and if it
+really is wedged, `(my/slime-interrupt)` ends it without touching the user's
+window.
 
 If you find better variants, tell me so I can improve this prompt.
 ````
