@@ -64,8 +64,11 @@ once and the shell does the waiting:
 (my/slime-busy-p)                     ; poll this from the shell, sleeping there
 (my/slime-output-since-mark 2000)     ; collect the result
 
-;; …or, to avoid emacsclient's string escaping entirely:
-(my/slime-output-since-mark-to-file "/tmp/out.txt")   ; then just cat it
+;; …or, to avoid emacsclient's string escaping entirely — which you MUST when a
+;; recompile spews `redefining ...' warnings, since send-wait then trips
+;; "*ERROR*: Unknown message:" mid-stream — write straight to a file and cat it:
+(my/slime-output-since-mark-to-file "/tmp/out.txt")
+(my/slime-send-wait-to-file "/tmp/out.txt" "(asdf:load-system :sys :force t)" 300)
 (my/slime-interrupt)                  ; stop a runaway form you started
 ```
 
@@ -77,8 +80,16 @@ returning `:error` — instead of blocking on an SLDB debugger buffer:
 (my/slime-send-capturing "(risky-form)" 40)    ; …and show up to 40 backtrace frames
 ```
 
-When you *interrupt* a hung form the story is different — the interrupt is not
-an `error`, so it always lands in SLDB. Read that backtrace and recover with:
+A *hang* you can wrap in a form is best bounded by a self-timeout, which prints
+the same spin-point backtrace without ever entering SLDB:
+
+```elisp
+(my/slime-send-timed "(maybe-hangs)" 5)        ; with-timeout; returns :timed-out or :error
+```
+
+When you must *interrupt* something already running, the story is different — the
+interrupt is not an `error`, so it always lands in SLDB. Read that backtrace and
+recover with:
 
 ```elisp
 (my/slime-interrupt)                  ; stop the hang; SLDB opens with a backtrace
@@ -124,20 +135,30 @@ the policy only affects compilation done *after* it is set, so already-compiled
 functions keep whatever they were built with.
 
 ```lisp
-;; SBCL: a hard floor no local (declaim (optimize (speed 3))) can undo
+;; restrict-compiler-policy sets a FLOOR (min), optionally a CEILING (max):
+;;   (restrict-compiler-policy QUALITY &optional (min 0) (max 3))
+;; This pins debug UP to 3 -- a floor the source cannot lower:
 (sb-ext:restrict-compiler-policy 'debug 3)
-(sb-ext:restrict-compiler-policy 'speed 0)
 
-;; …or the portable global declamation
+;; BEWARE: (restrict-compiler-policy 'speed 0) is a NO-OP -- it sets a floor, and
+;; speed >= 0 is always true, so a source (declaim (optimize (speed 3))) still
+;; wins.  To force speed DOWN regardless of the source, cap it with the max arg:
+(sb-ext:restrict-compiler-policy 'speed 0 0)   ; min 0, max 0 -> pins speed at 0
+
+;; …or the portable global declamation.  This one is a real setter, but only of
+;; the DEFAULT policy -- a file-local declaim still overrides it for that file:
 (declaim (optimize (debug 3) (speed 0) (safety 3)))
 
-;; then force the recompile so it takes effect
+;; then force the recompile so any of the above takes effect
 (asdf:load-system "my-system" :force t)   ; :force :all also rebuilds deps
 ```
 
-`restrict-compiler-policy` is the more reliable of the two for "make everything
-debuggable", because a stray `(optimize (speed 3))` inside the source cannot win
-against a floor. Undo it later with `(sb-ext:restrict-compiler-policy 'debug 0)`.
+The `restrict-compiler-policy` forms are the reliable ones for "make everything
+debuggable whatever the source says": a floor (`debug 3`) or ceiling (`speed 0 0`)
+clamps the *effective* policy after the code's own declarations, so a stray
+`(optimize …)` cannot undo them — which a plain `declaim` (the default only)
+can't promise. Undo them later with `(sb-ext:restrict-compiler-policy 'debug 0)`
+and `(sb-ext:restrict-compiler-policy 'speed 0 3)` (max back to 3).
 
 ### Catch errors instead of dropping into SLDB
 
@@ -198,6 +219,46 @@ Backtrace:
 again. The `-56` (and the `RUN-UNTIL` frame at all) is only visible because the
 policy was raised to `debug 3` first — another reason the two halves of this
 section belong together.
+
+### Deterministic self-timeout — safer than interrupt
+
+When the hang is something you can wrap in a form, prefer `my/slime-send-timed`
+over interrupting. It bounds the call with `sb-ext:with-timeout`, so the image
+times *itself* out and prints the same spin-point backtrace — no external
+`SIGINT`, no modal SLDB round-trip, and the stack unwinds cleanly so the prompt
+returns on its own:
+
+```elisp
+(my/slime-send-timed "(run-until 0)" 5)      ; give up after 5 s, print the backtrace
+(my/slime-send-timed "(run-until 0)" 5 40)   ; …with up to 40 frames
+```
+
+The backtrace is taken at the hang (via `handler-bind`, before unwinding), just
+like the interrupt path, and the same wrapper also catches an `error` if the form
+blows up first — the form returns `:timed-out` or `:error`. Because the image is
+never parked in SLDB, `my/slime-busy-p` never gets stuck at `t`. Keep
+`my/slime-interrupt` for stopping something *already* running that you did not
+launch through `send-timed`.
+
+### When raising debug *changes* the bug
+
+The `run-until` example is a *logic* bug: it hangs at every optimization policy,
+and `debug 3` merely makes the frame's `-56` legible. A nastier class announces
+itself differently — **raising `debug` (or `safety`) makes the hang or the wrong
+answer disappear.** That is the signature of a miscompilation or an unsound
+declaration, not a program-logic error: typically a wrong `(the TYPE …)` or
+`(declaim (type …))` that the compiler trusts at low `safety`, producing code
+that misbehaves only when optimized. Two techniques:
+
+- **Bisect the level that still reproduces.** Recompile at successively higher
+  `debug`/`safety` until the symptom vanishes; the boundary confirms it is an
+  optimization/declaration problem rather than logic, and points at the quality
+  to distrust.
+- **Un-inline the suspects.** At high `speed` SBCL inlines small helpers, so the
+  spinning frame is collapsed into its caller and the backtrace shows only the
+  outer function with `#<unavailable>` arguments. `(declaim (notinline foo bar))`
+  (then recompile) keeps those frames separate, so the backtrace names the
+  function that is actually looping and shows its arguments.
 
 ## 1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no Emacs)
 
@@ -337,7 +398,9 @@ Then:
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
+| bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| submit + wait, output to a file (dodges escaping on noisy builds) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
 | read the backtrace after an interrupt | `(my/slime-sldb-backtrace)` / `(my/slime-sldb-backtrace-to-file "/tmp/bt.txt")` |
@@ -413,7 +476,7 @@ Launch system tests
 Force the compiler to debug 3 / speed 0, reload cl-abc, then run (main) but catch any error in the REPL instead of dropping me into SLDB — I want to see the condition and a backtrace.
 ```
 
-This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `speed 0`), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
+This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `(sb-ext:restrict-compiler-policy 'speed 0 0)` to actually cap speed — a bare `'speed 0` is a no-op), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
 
 **Example where a test hangs:**
 
@@ -483,7 +546,9 @@ Then:
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
+| bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| submit + wait, output to a file (dodges escaping on noisy builds) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
 | read the backtrace after an interrupt | `(my/slime-sldb-backtrace)` / `(my/slime-sldb-backtrace-to-file "/tmp/bt.txt")` |
@@ -550,7 +615,7 @@ Launch system tests
 Force the compiler to debug 3 / speed 0, reload cl-abc, then run (main) but catch any error in the REPL instead of dropping me into SLDB — I want to see the condition and a backtrace.
 ```
 
-This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `speed 0`), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
+This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `(sb-ext:restrict-compiler-policy 'speed 0 0)` to actually cap speed — a bare `'speed 0` is a no-op), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
 
 **Example where a test hangs:**
 

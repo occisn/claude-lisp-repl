@@ -146,6 +146,40 @@ the result.  Note the wrapper only traps `error'; conditions that are not
     (or n-frames 20) code)
    force))
 
+(defun my/slime-send-timed (code seconds &optional n-frames force)
+  "Send CODE wrapped in `sb-ext:with-timeout' so a HANG self-reports in the REPL.
+If CODE does not finish within SECONDS -- or signals an `error' first -- the REPL
+prints a backtrace taken at the point of the hang/error (via `handler-bind',
+before the stack unwinds) and the form returns `:timed-out' or `:error';
+otherwise CODE's own value is returned.  N-FRAMES defaults to 20.
+
+This is the deterministic, safer alternative to `my/slime-interrupt': the timeout
+is delivered by the image's own timer, so there is no external SIGINT and the
+image is never left parked in SLDB -- it unwinds cleanly and the prompt returns.
+Use it for any hang you can wrap in a single form; keep `my/slime-interrupt' for
+stopping something already running that you did not launch this way.  Returns
+\"sent\" immediately, like `my/slime-send'."
+  (my/slime-send
+   (format
+    (concat "(block my/slime--timed\n"
+            "  (handler-bind\n"
+            "      ((sb-ext:timeout\n"
+            "         (lambda (c)\n"
+            "           (format t \"~&; TIMEOUT after %s s -- backtrace at the hang:~%%\")\n"
+            "           (ignore-errors\n"
+            "             (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
+            "           (return-from my/slime--timed (values :timed-out c))))\n"
+            "       (error\n"
+            "         (lambda (c)\n"
+            "           (format t \"~&; CONDITION ~s: ~a~%%\" (type-of c) c)\n"
+            "           (ignore-errors\n"
+            "             (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
+            "           (return-from my/slime--timed (values :error c)))))\n"
+            "    (sb-ext:with-timeout %s\n"
+            "      %s)))")
+    seconds (or n-frames 20) (or n-frames 20) seconds code)
+   force))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Reading results back
 ;;;
@@ -259,6 +293,21 @@ slow use the mark/send/poll/read sequence below instead."
   (let ((coding-system-for-write 'utf-8-unix))
     (with-temp-file path (insert string)))
   path)
+
+(defun my/slime-send-wait-to-file (path code &optional timeout-seconds n-chars force)
+  "Like `my/slime-send-wait' but write the captured output to PATH instead of
+returning it.  Return PATH.
+
+`my/slime-send-wait' hands its result back as the `emacsclient --eval' return
+value, whose string escaping mangles newlines and can make emacsclient emit
+\"*ERROR*: Unknown message:\" mid-stream on noisy output -- exactly what a
+recompile full of `redefining ...' warnings produces.  This variant builds the
+string inside Emacs and writes it straight to disk, so the shell just reads plain
+UTF-8.  (It still blocks Emacs in `sleep-for' while waiting; for long, noisy
+builds prefer the non-blocking `my/slime-mark' / poll / `my/slime-output-since-\
+mark-to-file' sequence, which does not freeze Emacs.)"
+  (my/slime-write-string-to-file
+   (my/slime-send-wait code timeout-seconds n-chars force) path))
 
 (defun my/slime-output-since-mark-to-file (path &optional max-chars)
   "Write `my/slime-output-since-mark' to PATH as UTF-8.  Return PATH."
