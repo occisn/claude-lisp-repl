@@ -386,5 +386,89 @@ the connection sits in the debugger and `my/slime-busy-p' stays t.  Returns
           :pending-input (my/slime-pending-input)
           :tail (string-trim (my/slime-repl-tail 200)))))
 
+;;; ---------------------------------------------------------------------------
+;;; A push signal for "the REPL is available again"
+;;;
+;;; SLIME ships NO hook that fires when evaluation finishes and the prompt
+;;; returns.  `slime-busy-p' (which `my/slime-busy-p' wraps) is poll-only -- it
+;;; just inspects the pending `slime-rex-continuations'.  `slime-event-hooks'
+;;; fires for EVERY protocol event and is run with
+;;; `run-hook-with-args-until-success', so a function that returns non-nil would
+;;; swallow the event and break SLIME; it also sees autodoc/completion traffic,
+;;; not just the REPL.  And the per-form `slime-eval-async'/`slime-rex'
+;;; continuations do not apply here, because this bridge sends forms as REPL
+;;; input (`slime-repl-return'), never through `slime-eval-async'.
+;;;
+;;; What DOES fire on exactly the transition we want is `slime-repl-insert-
+;;; prompt': both the `:ok' and `:abort' listener continuations call it once the
+;;; result is in and the prompt is redrawn, and it is NOT called while the form
+;;; is parked in SLDB -- the same boundary `my/slime-busy-p' already draws.  So
+;;; we advise it and expose `my/slime-repl-idle-functions', letting Emacs-side
+;;; code react to idle instead of polling.  The gate `(not (my/slime-busy-p))'
+;;; means that with several forms pipelined the hook runs only when the LAST one
+;;; drains, i.e. on the genuine idle edge.
+;;;
+;;; For a shell driver that cannot receive an Elisp callback, `my/slime-send-
+;;; then-touch' turns that edge into a file: send, then create PATH when the
+;;; prompt returns.  The shell blocks on PATH appearing (a `while [ ! -e PATH ]'
+;;; or an inotifywait) instead of re-polling `my/slime-busy-p' in a loop.
+;;; ---------------------------------------------------------------------------
+
+(defvar my/slime-repl-idle-functions nil
+  "Abnormal hook run when the SLIME REPL prompt returns and the Lisp is idle.
+Each function is called with no arguments.  Fired by an `:after' advice on
+`slime-repl-insert-prompt', gated on `slime-connected-p' and
+\(not (my/slime-busy-p)), so with pipelined forms it runs only once the last
+one drains.  Errors in a function are demoted to a message so they cannot
+corrupt SLIME's prompt handling.  Note the prompt is also redrawn on a package
+switch (`slime-repl-set-package'), so a stray idle-edge is possible; keep the
+functions cheap and idempotent.")
+
+(defun my/slime--run-idle-functions (&rest _)
+  "Run `my/slime-repl-idle-functions' when connected and not busy.
+Advice target: `slime-repl-insert-prompt'.  Always returns nil and never
+signals, so it cannot alter or break prompt insertion."
+  (when (and (fboundp 'slime-connected-p)
+             (ignore-errors (slime-connected-p))
+             (not (my/slime-busy-p)))
+    (with-demoted-errors "my/slime idle hook error: %S"
+      (run-hooks 'my/slime-repl-idle-functions)))
+  nil)
+
+(when (fboundp 'slime-repl-insert-prompt)
+  ;; `advice-add' de-duplicates by function symbol, so reloading this file does
+  ;; not stack the advice.
+  (advice-add 'slime-repl-insert-prompt :after #'my/slime--run-idle-functions))
+
+(defun my/slime-run-once-when-idle (fn)
+  "Arrange for FN (no arguments) to run once, the next time the REPL is idle.
+Returns the internal hook entry, so a caller that decides not to wait can pass
+it to `remove-hook' on `my/slime-repl-idle-functions'.  The entry removes
+itself before calling FN, so a re-entrant FN cannot re-trigger it."
+  (letrec ((entry (lambda ()
+                    (remove-hook 'my/slime-repl-idle-functions entry)
+                    (funcall fn))))
+    (add-hook 'my/slime-repl-idle-functions entry)
+    entry))
+
+(defun my/slime-send-then-touch (path code &optional force)
+  "Send CODE via the REPL, then create/overwrite PATH when the prompt returns.
+Lets a shell driver BLOCK on PATH appearing (e.g. `while [ ! -e PATH ]; do
+sleep 0.1; done') instead of re-polling `my/slime-busy-p'.  The one-shot is
+armed BEFORE sending so a fast form cannot finish first; if `my/slime-send'
+signals (e.g. unsent input at the prompt and FORCE nil) the one-shot is removed
+and the error re-raised, so PATH is never touched for a form that did not run.
+Returns \"sent\" immediately, like `my/slime-send'; PATH's contents are empty --
+it is a done-sentinel, not the result.  For the result, mark first and read
+`my/slime-output-since-mark-to-file' once PATH shows up."
+  (let ((entry (my/slime-run-once-when-idle
+                (lambda () (my/slime-write-string-to-file "" path)))))
+    (condition-case err
+        (my/slime-send code force)
+      (error
+       (remove-hook 'my/slime-repl-idle-functions entry)
+       (signal (car err) (cdr err)))))
+  "sent")
+
 (provide 'slime-bridge)
 ;;; slime-bridge.el ends here

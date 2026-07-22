@@ -14,7 +14,7 @@ Three transports are documented, from simplest to most integrated:
 
 A recurring convention across all three: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
-Approaches 2 and 3 share one set of elisp helpers, [`slime-bridge.el`](slime-bridge.el), covering staging, submitting, waiting for the prompt, and reading output back — see [Helper functions](#helper-functions).
+Approaches 2 and 3 share one set of elisp helpers, [`slime-bridge.el`](slime-bridge.el), covering staging, submitting, waiting for the prompt, reading output back, and signalling when the REPL falls idle — see [Helper functions](#helper-functions).
 
 Any comment? Open an [issue](https://github.com/occisn/claude-lisp-repl/issues), or start a discussion [here](https://github.com/occisn/claude-lisp-repl/discussions) or [at profile level](https://github.com/occisn/occisn/discussions).
 
@@ -71,6 +71,33 @@ once and the shell does the waiting:
 (my/slime-send-wait-to-file "/tmp/out.txt" "(asdf:load-system :sys :force t)" 300)
 (my/slime-interrupt)                  ; stop a runaway form you started
 ```
+
+Instead of *polling* `my/slime-busy-p` at all, you can be *told* when the REPL
+falls idle. SLIME ships no such hook — `my/slime-repl-idle-functions` adds one,
+run each time the prompt returns *and* the Lisp is idle (so with several forms
+pipelined it fires only when the last one drains, not between them):
+
+```elisp
+;; Emacs-side: react to idle however you like
+(add-hook 'my/slime-repl-idle-functions (lambda () (message "REPL free")))
+(my/slime-run-once-when-idle (lambda () …))    ; fire exactly once, next idle
+
+;; Shell-side: send, then have the prompt-return create a sentinel FILE, so the
+;; shell can BLOCK on the file appearing instead of re-polling my/slime-busy-p:
+(my/slime-send-then-touch "/tmp/done" "(asdf:load-system :sys :force t)")
+```
+
+```sh
+emacsclient --eval '(my/slime-send-then-touch "/tmp/done" "(long-form)")'
+while [ ! -e /tmp/done ]; do sleep 0.2; done      # woken by the prompt returning
+```
+
+It rides the same prompt-return edge as everything else, so it does **not** fire
+while a form is parked in SLDB (matching `my/slime-busy-p`), and the one-shot is
+armed *before* the form is sent so a fast form cannot finish first. One caveat: a
+package switch also redraws the prompt, so keep idle functions cheap and
+idempotent. This is a REPL-input signal — for arbitrary background RPCs
+(`slime-eval-async`) you would hook `slime-event-hooks` instead.
 
 To keep an error *in* the REPL — printing its condition and a backtrace, and
 returning `:error` — instead of blocking on an SLDB debugger buffer:
@@ -400,6 +427,7 @@ Then:
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| be *told* when idle instead of polling (sentinel file for the shell to wait on) | `(my/slime-send-then-touch "/tmp/done" "FORM")`, then `while [ ! -e /tmp/done ]; do sleep 0.2; done` |
 | submit + wait, output to a file (dodges escaping on noisy builds) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
@@ -548,6 +576,7 @@ Then:
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| be *told* when idle instead of polling (sentinel file for the shell to wait on) | `(my/slime-send-then-touch "/tmp/done" "FORM")`, then `while [ ! -e /tmp/done ]; do sleep 0.2; done` |
 | submit + wait, output to a file (dodges escaping on noisy builds) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
