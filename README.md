@@ -32,6 +32,7 @@ Approaches 2 and 3 also use [`slime-bridge.el`](slime-bridge.el) from this repos
 
 - [Prerequisites](#prerequisites)
 - [Helper functions](#helper-functions)
+- [Compilation policy and catching errors](#compilation-policy-and-catching-errors)
 - [1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no emacs)](#1-claude-interacts-with-lisp-image-created-within-tmux-session-through-tmux-repl-no-emacs)
 - [2. Claude interacts with Lisp image created within tmux session, through (Windows) Emacs](#2-claude-interacts-with-lisp-image-created-within-tmux-session-through-windows-emacs)
 - [3. Claude interacts with Lisp image created within Emacs through Emacs REPL](#3-claude-interacts-with-lisp-image-created-within-emacs-through-emacs-repl)
@@ -68,6 +69,23 @@ once and the shell does the waiting:
 (my/slime-interrupt)                  ; stop a runaway form you started
 ```
 
+To keep an error *in* the REPL — printing its condition and a backtrace, and
+returning `:error` — instead of blocking on an SLDB debugger buffer:
+
+```elisp
+(my/slime-send-capturing "(risky-form)")       ; wrap in handler-bind, then send
+(my/slime-send-capturing "(risky-form)" 40)    ; …and show up to 40 backtrace frames
+```
+
+When you *interrupt* a hung form the story is different — the interrupt is not
+an `error`, so it always lands in SLDB. Read that backtrace and recover with:
+
+```elisp
+(my/slime-interrupt)                  ; stop the hang; SLDB opens with a backtrace
+(my/slime-sldb-backtrace)             ; return the debugger buffer text (the frames)
+(my/slime-sldb-abort)                 ; back to the top-level REPL prompt
+```
+
 Four things the file is careful about, each learned the hard way:
 
 - **`slime-output-buffer` signals when nothing is connected**, it does not return
@@ -89,6 +107,97 @@ Four things the file is careful about, each learned the hard way:
 - **The REPL is never forced into the user's window.** It is surfaced only when
   it is not already visible in some window on some frame (`0` = all frames,
   including iconified ones).
+
+## Compilation policy and catching errors
+
+Both of these are just Lisp, so they need no transport of their own — you send
+them through the same REPL as everything else (approaches 2 and 3 with
+`my/slime-send`, approach 1 with `tmux send-keys`). They matter when you and
+Claude are debugging together and want more information out of the image.
+
+### Force full debug info (`debug 3` / `speed 0`)
+
+The compiler's optimization policy governs how much the debugger can later show
+you — variable values, un-collapsed stack frames, working single-stepping. To
+raise it, set the policy and then **recompile the code you want instrumented**;
+the policy only affects compilation done *after* it is set, so already-compiled
+functions keep whatever they were built with.
+
+```lisp
+;; SBCL: a hard floor no local (declaim (optimize (speed 3))) can undo
+(sb-ext:restrict-compiler-policy 'debug 3)
+(sb-ext:restrict-compiler-policy 'speed 0)
+
+;; …or the portable global declamation
+(declaim (optimize (debug 3) (speed 0) (safety 3)))
+
+;; then force the recompile so it takes effect
+(asdf:load-system "my-system" :force t)   ; :force :all also rebuilds deps
+```
+
+`restrict-compiler-policy` is the more reliable of the two for "make everything
+debuggable", because a stray `(optimize (speed 3))` inside the source cannot win
+against a floor. Undo it later with `(sb-ext:restrict-compiler-policy 'debug 0)`.
+
+### Catch errors instead of dropping into SLDB
+
+When a form errors, SLIME opens an **SLDB** debugger buffer and the evaluation
+blocks there — and `my/slime-busy-p` stays `t` the whole time, so a shell poll
+loop waits forever. For a driver that fires and reports, it is usually better to
+keep the error *in* the REPL. `my/slime-send-capturing` wraps the form so any
+`error` prints its type, message and a backtrace, then returns `:error` instead
+of entering the debugger:
+
+```elisp
+(my/slime-send-capturing "(risky-form)")       ; default 20 backtrace frames
+(my/slime-send-capturing "(risky-form)" 40)    ; up to 40 frames
+```
+
+The wrapper uses `handler-bind`, not `handler-case`, so the backtrace is taken
+at the point the error was *signalled* (before the stack unwinds) and actually
+shows where it came from. It traps `error` only — a deliberate `C-c` interrupt,
+and conditions that are not `error` subtypes, still reach SLDB as usual. For the
+richest backtrace, raise the debug policy (above) before you recompile the code
+under test.
+
+### Interrupt a hang, then read the backtrace
+
+`my/slime-send-capturing` does **not** help when a form *hangs* rather than
+errors: interrupting it (`my/slime-interrupt`, = `C-c C-c`) raises
+`sb-sys:interactive-interrupt`, which is a `serious-condition` but **not** an
+`error`, so no `handler-bind` on `error` catches it — it always drops into SLDB.
+And while the connection sits in SLDB, `my/slime-busy-p` stays `t`, so a shell
+poll loop would wait forever. Three helpers reach the debugger buffer that the
+REPL-reading helpers never touch:
+
+```elisp
+(my/slime-interrupt)             ; stop the hang; SLDB opens
+(my/slime-sldb-backtrace)        ; the debugger buffer text — condition, restarts, frames
+(my/slime-sldb-abort)            ; invoke ABORT, returning to the top-level prompt
+```
+
+`my/slime-repl-status` also gains an `:in-debugger` flag so one call tells you
+the connection is parked in SLDB. To avoid `emacsclient`'s newline escaping on
+the multi-line frames, write the backtrace straight to a file with
+`my/slime-sldb-backtrace-to-file` and read it from the shell.
+
+For example, a loop that decrements its index by mistake and only exits on
+`(> n 100)` never terminates. Raise the debug policy, define it, let it spin,
+then interrupt — the backtrace pins the bug, showing the index deep in negative
+territory:
+
+```
+Backtrace:
+  0: (SB-UNIX::WITH-DEFERRABLE-SIGNALS-UNBLOCKED T ...)
+  2: (SB-UNIX:NANOSLEEP 0 20000000)
+  3: (RUN-UNTIL -56)              ; <- n is negative: the decf should have been incf
+  4: (SB-INT:SIMPLE-EVAL-IN-LEXENV (RUN-UNTIL 0) #<NULL-LEXENV>)
+```
+
+`(my/slime-sldb-abort)` then returns to the prompt and the image is usable
+again. The `-56` (and the `RUN-UNTIL` frame at all) is only visible because the
+policy was raised to `debug 3` first — another reason the two halves of this
+section belong together.
 
 ## 1. Claude interacts with Lisp image created within tmux session, through tmux REPL (no Emacs)
 
@@ -227,9 +336,12 @@ Then:
 | stage without evaluating | `(my/slime-stage "FORM")` |
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
+| submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
+| read the backtrace after an interrupt | `(my/slime-sldb-backtrace)` / `(my/slime-sldb-backtrace-to-file "/tmp/bt.txt")` |
+| leave the debugger | `(my/slime-sldb-abort)` |
 | where am I | `(my/slime-repl-status)` |
 
 Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
@@ -295,6 +407,22 @@ I have modified code; force reload and execute main function
 Launch system tests
 ```
 
+**Example involving the debugger and compilation policy:**
+
+```
+Force the compiler to debug 3 / speed 0, reload cl-abc, then run (main) but catch any error in the REPL instead of dropping me into SLDB — I want to see the condition and a backtrace.
+```
+
+This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `speed 0`), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
+
+**Example where a test hangs:**
+
+```
+The test seems stuck — interrupt it and show me the backtrace so we can see where it is spinning, then get the REPL back.
+```
+
+Claude sends `(my/slime-interrupt)`, reads `(my/slime-sldb-backtrace)` (the frames name the looping function and, at `debug 3`, its arguments), then `(my/slime-sldb-abort)` to return to the prompt.
+
 **Note:** you can obviously use Emacs commands to modify and compile sections of code, for instance `C-c C-c`.
 
 **Note:** even if the purpose of this section is to work through the Emacs REPL, you can still reach the tmux REPL via
@@ -354,9 +482,12 @@ Then:
 | stage without evaluating | `(my/slime-stage "FORM")` |
 | submit | `(my/slime-send "FORM")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
+| submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
 | output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
+| read the backtrace after an interrupt | `(my/slime-sldb-backtrace)` / `(my/slime-sldb-backtrace-to-file "/tmp/bt.txt")` |
+| leave the debugger | `(my/slime-sldb-abort)` |
 | where am I | `(my/slime-repl-status)` |
 
 Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`,
@@ -412,5 +543,21 @@ I have modified code; force reload and execute main function
 ```
 Launch system tests
 ```
+
+**Example involving the debugger and compilation policy:**
+
+```
+Force the compiler to debug 3 / speed 0, reload cl-abc, then run (main) but catch any error in the REPL instead of dropping me into SLDB — I want to see the condition and a backtrace.
+```
+
+This has Claude send `(sb-ext:restrict-compiler-policy 'debug 3)` (and `speed 0`), `(asdf:load-system "cl-abc" :force t)`, then `(my/slime-send-capturing "(main)")` — see [Compilation policy and catching errors](#compilation-policy-and-catching-errors).
+
+**Example where a test hangs:**
+
+```
+The test seems stuck — interrupt it and show me the backtrace so we can see where it is spinning, then get the REPL back.
+```
+
+Claude sends `(my/slime-interrupt)`, reads `(my/slime-sldb-backtrace)` (the frames name the looping function and, at `debug 3`, its arguments), then `(my/slime-sldb-abort)` to return to the prompt.
 
 (end of README)

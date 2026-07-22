@@ -110,6 +110,43 @@ The forms run as visible REPL input and land in the SLIME history."
   "sent")
 
 ;;; ---------------------------------------------------------------------------
+;;; Catching errors instead of dropping into SLDB
+;;;
+;;; When a form errors, SLIME pops an SLDB buffer and the evaluation blocks
+;;; there waiting for a restart -- `my/slime-busy-p' stays t the whole time, so
+;;; a shell poll loop would wait forever.  For a driver that fires and reports,
+;;; it is usually better to keep the error IN the REPL: wrap the form so any
+;;; `error' prints its type, message and a backtrace, then returns `:error'
+;;; instead of entering the debugger.
+;;;
+;;; `handler-bind' (not `handler-case') runs the handler BEFORE the stack
+;;; unwinds, so the backtrace is taken at the signalling point and actually
+;;; shows where the error came from; the enclosing `block'/`return-from' then
+;;; performs the unwind cleanly.  SBCL-specific (`sb-debug:print-backtrace').
+;;; ---------------------------------------------------------------------------
+
+(defun my/slime-send-capturing (code &optional n-frames force)
+  "Send CODE wrapped so any ERROR self-reports in the REPL instead of opening SLDB.
+On error the REPL prints \"; CONDITION <type>: <message>\" followed by up to
+N-FRAMES backtrace frames (default 20) and the form returns `:error'; on success
+CODE's own value is returned unchanged.  Like `my/slime-send' this returns
+\"sent\" immediately -- watch the REPL (or use the mark/poll/read helpers) for
+the result.  Note the wrapper only traps `error'; conditions that are not
+`error' subtypes, and a deliberate C-c interrupt, still reach SLDB as usual."
+  (my/slime-send
+   (format
+    (concat "(block my/slime--capture\n"
+            "  (handler-bind\n"
+            "      ((error (lambda (c)\n"
+            "                (format t \"~&; CONDITION ~s: ~a~%%\" (type-of c) c)\n"
+            "                (ignore-errors\n"
+            "                  (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
+            "                (return-from my/slime--capture (values :error c)))))\n"
+            "    %s))")
+    (or n-frames 20) code)
+   force))
+
+;;; ---------------------------------------------------------------------------
 ;;; Reading results back
 ;;;
 ;;; Without these there is no way to know the prompt has returned, which is what
@@ -231,6 +268,62 @@ slow use the mark/send/poll/read sequence below instead."
   "Write `my/slime-repl-tail' to PATH as UTF-8.  Return PATH."
   (my/slime-write-string-to-file (my/slime-repl-tail n-chars) path))
 
+;;; ---------------------------------------------------------------------------
+;;; Reading the debugger after an interrupt
+;;;
+;;; Interrupting a hung form (`my/slime-interrupt', = C-c C-c) raises
+;;; `sb-sys:interactive-interrupt' -- which is a `serious-condition' but NOT an
+;;; `error', so `my/slime-send-capturing' does not catch it -- and SLIME opens
+;;; an SLDB debugger buffer with the backtrace at the point of the hang.  That
+;;; backtrace is exactly what tells you WHERE it was stuck (and, at debug 3, the
+;;; local values there), but it lives in the `*sldb ...*' buffer, which none of
+;;; the REPL-reading helpers above touch.  These three reach it:
+;;;
+;;;   (my/slime-interrupt)             -> stop the hang; SLDB opens
+;;;   (my/slime-sldb-backtrace)        -> read where it was stuck
+;;;   (my/slime-sldb-abort)            -> back to the top-level prompt
+;;; ---------------------------------------------------------------------------
+
+(defun my/slime-sldb-buffer ()
+  "Return the active SLDB debugger buffer, or nil when no debugger is open."
+  (let ((buf (or (ignore-errors (sldb-get-default-buffer))
+                 (car (ignore-errors (sldb-buffers))))))
+    (and (buffer-live-p buf) buf)))
+
+(defun my/slime-sldb-backtrace (&optional n-chars)
+  "Return the text of the active SLDB debugger buffer, or nil if none is open.
+This is the condition, the restart list and the backtrace frames Claude gets to
+see after an interrupt or an unhandled error.  Truncated to N-CHARS (default
+4000) from the TOP, because the condition and the first frames -- where the
+offending call and its arguments show -- are what matter, not the deep tail."
+  (let ((buf (my/slime-sldb-buffer)))
+    (when buf
+      (with-current-buffer buf
+        (let ((text (buffer-substring-no-properties (point-min) (point-max)))
+              (n (or n-chars 4000)))
+          (if (> (length text) n)
+              (concat (substring text 0 n) "\n...[truncated]...")
+            text))))))
+
+(defun my/slime-sldb-backtrace-to-file (path &optional n-chars)
+  "Write `my/slime-sldb-backtrace' to PATH as UTF-8.
+Return PATH, or nil when no debugger is open.  Preferred over reading the
+backtrace through `emacsclient --eval', whose string escaping mangles the
+multi-line frames."
+  (let ((text (my/slime-sldb-backtrace n-chars)))
+    (and text (my/slime-write-string-to-file text path))))
+
+(defun my/slime-sldb-abort ()
+  "Invoke the ABORT restart in the active SLDB buffer, returning to the REPL.
+Use once the backtrace has been read, so the image is usable again -- until then
+the connection sits in the debugger and `my/slime-busy-p' stays t.  Returns
+\"aborted\" if a debugger was open, \"no-debugger\" otherwise."
+  (let ((buf (my/slime-sldb-buffer)))
+    (if (not buf)
+        "no-debugger"
+      (with-current-buffer buf (sldb-abort))
+      "aborted")))
+
 (defun my/slime-repl-status ()
   "One-call summary: connection, REPL buffer, package, busy state, prompt tail."
   (if (not (and (fboundp 'slime-connected-p) (slime-connected-p)))
@@ -239,6 +332,7 @@ slow use the mark/send/poll/read sequence below instead."
           :repl-buffer (buffer-name (slime-output-buffer))
           :package (ignore-errors (slime-current-package))
           :busy (and (my/slime-busy-p) t)
+          :in-debugger (and (my/slime-sldb-buffer) t)
           :visible (and (get-buffer-window (slime-output-buffer) 0) t)
           :pending-input (my/slime-pending-input)
           :tail (string-trim (my/slime-repl-tail 200)))))
