@@ -10,9 +10,12 @@
 ;;
 ;;   emacsclient --eval '(load-file "/path/to/slime-bridge.el")'
 ;;
-;; On Windows Emacs the path must be in the Windows namespace, e.g.
-;; "C:/Users/you/src/claude-lisp-repl/slime-bridge.el", even when the call is
-;; issued from WSL.
+;; The path is in the namespace of the Emacs PROCESS, which may differ from the
+;; Windows or Linux Emacs -- a native Linux/WSL Emacs takes a Linux path
+;; ("/home/you/src/claude-lisp-repl/slime-bridge.el"); a Windows Emacs takes a
+;; Windows path ("C:/Users/you/src/claude-lisp-repl/slime-bridge.el") even when
+;; you call emacsclient from WSL.  `my/slime-host-info' reports which one you
+;; reached, so a dual-target driver can state its target and pick the path rules.
 ;;
 ;; Three rules this file enforces:
 ;;
@@ -373,11 +376,42 @@ the connection sits in the debugger and `my/slime-busy-p' stays t.  Returns
       (with-current-buffer buf (sldb-abort))
       "aborted")))
 
+(defun my/slime-host-info ()
+  "Report which Emacs is answering, so a dual-target driver can name its target.
+Unlike the other helpers this does NOT need SLIME connected -- it describes the
+Emacs PROCESS that `emacsclient' reached, which is what decides the path rules:
+
+  * `windows-nt' (or `cygwin'/`ms-dos') -> a Windows Emacs.  Paths sent to Emacs
+    (`load-file') and into the image (`load', `asdf') must be Windows form
+    (\"C:/...\"); your WSL shell uses the mount form (\"/mnt/c/...\").
+  * `gnu/linux' (or `darwin') -> a native Emacs.  Emacs, the image and the
+    shell all share the same plain paths; no translation.
+
+Call it right after loading this file -- before `M-x slime-connect' even -- to
+confirm and announce which target you are driving."
+  (let ((win (memq system-type '(windows-nt ms-dos cygwin))))
+    (list :emacs-system-type system-type
+          :windows-emacs (and win t)
+          :path-style (if win 'windows 'unix)
+          :emacs-version emacs-version
+          :slime-loaded (and (featurep 'slime) t)
+          :slime-connected (and (fboundp 'slime-connected-p)
+                                (ignore-errors (slime-connected-p)) t))))
+
 (defun my/slime-repl-status ()
-  "One-call summary: connection, REPL buffer, package, busy state, prompt tail."
+  "One-call summary: target, connection, REPL buffer, package, busy state, tail.
+`:emacs-system-type' and `:path-style' identify which Emacs (Windows or Linux)
+is answering -- see `my/slime-host-info' -- so the caller can pick path rules
+even from this single call."
   (if (not (and (fboundp 'slime-connected-p) (slime-connected-p)))
-      (list :connected nil)
+      (list :connected nil
+            :emacs-system-type system-type
+            :path-style (if (memq system-type '(windows-nt ms-dos cygwin))
+                            'windows 'unix))
     (list :connected t
+          :emacs-system-type system-type
+          :path-style (if (memq system-type '(windows-nt ms-dos cygwin))
+                          'windows 'unix)
           :repl-buffer (buffer-name (slime-output-buffer))
           :package (ignore-errors (slime-current-package))
           :busy (and (my/slime-busy-p) t)
