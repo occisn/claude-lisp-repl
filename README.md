@@ -495,6 +495,54 @@ that misbehaves only when optimized. Two techniques:
   (then recompile) keeps those frames separate, so the backtrace names the
   function that is actually looping and shows its arguments.
 
+### Recovering a wedged Emacs
+
+There is a nastier failure than an SLDB debugger or a hang: a **wedged
+`emacsclient` channel**, where *every* `emacsclient --eval` times out and Claude
+appears locked out of Emacs entirely. It comes from doing the one thing rule #1
+forbids — driving the image with a silent, synchronous `slime-eval`. If that
+form hits an open SLDB debugger, or the underlying SLIME connection dies
+mid-eval, the `slime-eval` never gets its reply, and Emacs stops servicing
+server requests while it waits.
+
+The signature is distinctive and, at first, baffling:
+
+- Every `emacsclient --eval '…'` times out — even pure Elisp with no SLIME in
+  it. `(+ 40 2)` times out; a form that just writes a file returns nothing and
+  the file never appears, proving the eval never ran.
+- `pgrep emacsclient` shows no lingering clients — they were each killed by their
+  own timeouts — yet Emacs still won't answer.
+- But **the user can still type in the SLIME REPL and use Emacs normally.** So it
+  looks like "Emacs is fine, only Claude is locked out." The queued
+  `emacsclient` requests are piling up as `server <N>` connections behind the one
+  stuck synchronous wait.
+
+**Recovery: `M-x top-level` in the Emacs window.** `C-g` usually does *not* clear
+it (the wait isn't at a spot a single quit unwinds), and killing signals from
+outside (`SIGUSR2`, etc.) don't help either. `M-x top-level` throws back to the
+top level, unwinds the stuck synchronous `slime-eval`, and flushes the whole
+backlog at once — you'll watch it drain:
+
+```
+Back to top level
+Error running timer 'slime-process-available-input': (error "Selecting deleted buffer")
+Process server <16> not running: connection broken by remote peer
+… (one line per queued emacsclient request) …
+Back to top level
+```
+
+After that, `emacsclient --eval` responds immediately again. If `top-level`
+somehow isn't enough, `M-x server-force-delete` then `M-x server-start` resets
+just the server without losing the image.
+
+**Prevention — this is exactly why rule #1 exists.** Every interaction must go
+through the visible REPL via the `my/slime-send*` helpers, never a bare
+`slime-eval`. Silent RPC is reserved for the headless, non-blocking preconditions
+(`my/slime-busy-p`, `my/slime-host-info`) — and even those return instantly, so
+they can never wedge the channel. A driver that catches this signature —
+`emacsclient` timing out on *everything* while the user's REPL still works —
+should stop retrying and ask the user to run `M-x top-level`.
+
 ## Annex A — tmux REPL, no Emacs
 
 The simplest shared REPL: SBCL runs in a detached tmux session and both you and
