@@ -29,8 +29,10 @@
 ;;
 ;; Usage convention (see the README prompts): stage or send, then report and
 ;; stop.  The user is watching the REPL, so reading results back is wasted
-;; effort unless they ask for them.  `my/slime-busy-p' before sending a NEW
-;; form is the exception -- a precondition check, not result analysis.
+;; effort unless they ask for them.  `my/slime-ready-p' before sending a NEW
+;; form is the exception -- a precondition check, not result analysis.  Use
+;; `my/slime-ready-p', NOT `my/slime-busy-p': the latter reports a form parked
+;; in SLDB as idle (see its docstring), so it cannot detect an open debugger.
 
 ;;; Code:
 
@@ -116,11 +118,16 @@ The forms run as visible REPL input and land in the SLIME history."
 ;;; Catching errors instead of dropping into SLDB
 ;;;
 ;;; When a form errors, SLIME pops an SLDB buffer and the evaluation blocks
-;;; there waiting for a restart -- `my/slime-busy-p' stays t the whole time, so
-;;; a shell poll loop would wait forever.  For a driver that fires and reports,
-;;; it is usually better to keep the error IN the REPL: wrap the form so any
-;;; `error' prints its type, message and a backtrace, then returns `:error'
-;;; instead of entering the debugger.
+;;; there waiting for a restart.  The trap for a shell driver is that
+;;; `my/slime-busy-p' goes NIL at that moment -- SLIME's `slime-busy-p' is
+;;; documented "Debugged requests are ignored" and removes the debugged
+;;; continuations -- so a parked form is indistinguishable from a finished one.
+;;; A poll loop does not hang; it reports success and fires the next form into
+;;; an open debugger.  Gate on `my/slime-ready-p' (idle AND no SLDB) instead.
+;;;
+;;; Better still, for a driver that fires and reports, keep the error IN the
+;;; REPL: wrap the form so any `error' prints its type, message and a
+;;; backtrace, then returns `:error' instead of entering the debugger.
 ;;;
 ;;; `handler-bind' (not `handler-case') runs the handler BEFORE the stack
 ;;; unwinds, so the backtrace is taken at the signalling point and actually
@@ -197,21 +204,51 @@ Deliberately coerced to a strict boolean.  The documented workflow polls this
 from the shell via `emacsclient --eval', which PRINTS the value, and SLIME's own
 `slime-busy-p' returns the list of pending continuations rather than t/nil.  A
 shell test like [ \"$x\" = \"nil\" ] would then never match and the caller would
-poll forever."
+poll forever.
+
+IMPORTANT -- this is NOT a \"safe to send\" test.  SLIME's `slime-busy-p' is
+documented \"Debugged requests are ignored\": it removes the continuations that
+`sldb-debugged-continuations' reports, so a form that has died into SLDB reads
+exactly like one that finished cleanly.  Polling this alone therefore reports
+the REPL idle seconds after a form errored, and the next form is fired into an
+open debugger.  Use `my/slime-ready-p' as the precondition before sending."
   (and (fboundp 'slime-busy-p)
        (not (null (ignore-errors (slime-busy-p))))))
+
+(defun my/slime-ready-p ()
+  "Return t when it is safe to send a new form: connected, idle, no debugger.
+
+This -- not `my/slime-busy-p' -- is the precondition check to poll before
+sending.  `my/slime-busy-p' deliberately keeps its strict busy/not-busy
+contract (a shell poll loop needs a two-valued answer), but \"not busy\" is not
+the same as \"ready\": a form parked in SLDB is not busy, and neither is a dead
+connection.  This conjoins the three conditions `my/slime-repl-status' reports
+separately as :connected, :busy and :in-debugger.
+
+Also strictly t/nil, for the same shell-printing reason.  When it returns nil
+and you need to know WHY, call `my/slime-repl-status'."
+  (and (fboundp 'slime-connected-p)
+       (ignore-errors (slime-connected-p))
+       (not (my/slime-busy-p))
+       (not (my/slime-sldb-buffer))
+       t))
 
 (defun my/slime-interrupt ()
   "Interrupt the running evaluation -- the shell-side equivalent of C-c C-c.
 
 Lets a caller stop a runaway form it started itself, without touching whatever
 window the user is looking at.  Returns \"interrupted\" if a request was sent,
-\"idle\" if nothing was running."
-  (if (my/slime-busy-p)
-      (progn (my/slime-assert-connected)
-             (slime-interrupt)
-             "interrupted")
-    "idle"))
+\"in-debugger\" when a form is parked in SLDB (there is nothing to interrupt --
+use `my/slime-sldb-backtrace' then `my/slime-sldb-abort'), and \"idle\" when
+nothing was running.  The SLDB case is reported separately because
+`my/slime-busy-p' alone cannot distinguish it from a clean idle prompt."
+  (cond
+   ((my/slime-busy-p)
+    (my/slime-assert-connected)
+    (slime-interrupt)
+    "interrupted")
+   ((my/slime-sldb-buffer) "in-debugger")
+   (t "idle")))
 
 (defun my/slime-repl-tail (&optional n-chars)
   "Return the last N-CHARS characters of the SLIME REPL buffer (default 2000)."
@@ -230,6 +267,13 @@ against earlier scrollback.  TIMEOUT-SECONDS defaults to 60; on timeout the text
 captured so far is returned with a [TIMEOUT] marker and the evaluation is left
 running rather than killed.
 
+If CODE errors into SLDB the wait ends immediately -- a debugged request is no
+longer \"busy\" -- and the text is returned with an [SLDB] marker.  Without that
+marker the return would be indistinguishable from a clean completion, which is
+the trap described in `my/slime-busy-p'.  Recover with `my/slime-sldb-backtrace'
+and `my/slime-sldb-abort', or avoid the debugger entirely with
+`my/slime-send-capturing'.
+
 BEWARE: this blocks Emacs in `sleep-for'.  Timers and process filters still run
 -- so REPL output keeps arriving -- but the user's KEYSTROKES are merely queued,
 and Emacs feels frozen for the duration.  Fine for a quick form; for anything
@@ -241,25 +285,37 @@ slow use the mark/send/poll/read sequence below instead."
     ;; Let the request register before testing busy-ness, otherwise a fast form
     ;; can look idle before it ever started.
     (sleep-for 0.05)
-    (while (and (my/slime-busy-p) (< (float-time) deadline))
+    ;; The SLDB test is not redundant with the busy test: a form that drops
+    ;; into the debugger stops counting as busy, so this loop would exit on its
+    ;; own -- the point is to record WHY it exited, below.
+    (while (and (my/slime-busy-p)
+                (not (my/slime-sldb-buffer))
+                (< (float-time) deadline))
       (sleep-for 0.05))
-    (let ((timed-out (and (my/slime-busy-p) (>= (float-time) deadline))))
+    (let ((in-sldb (and (my/slime-sldb-buffer) t))
+          (timed-out (and (my/slime-busy-p) (>= (float-time) deadline))))
       (with-current-buffer buf
         (let ((text (buffer-substring-no-properties
                      (min start (point-max)) (point-max))))
-          (if timed-out
-              (concat text "\n[TIMEOUT -- evaluation still running]")
-            (if (and n-chars (> (length text) n-chars))
-                (substring text (- (length text) n-chars))
-              text)))))))
+          (cond
+           (in-sldb
+            (concat text "\n[SLDB -- evaluation parked in the debugger]"))
+           (timed-out
+            (concat text "\n[TIMEOUT -- evaluation still running]"))
+           ((and n-chars (> (length text) n-chars))
+            (substring text (- (length text) n-chars)))
+           (t text)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Long-running work: mark / send / poll / read
 ;;;
 ;;;   (my/slime-mark)                  -> remember where output starts
 ;;;   (my/slime-send "(long-form)")    -> returns immediately
-;;;   (my/slime-busy-p)                -> poll from the shell, sleeping THERE
+;;;   (my/slime-ready-p)               -> poll from the shell, sleeping THERE
 ;;;   (my/slime-output-since-mark)     -> collect the result
+;;;
+;;; Poll `my/slime-ready-p', not `my/slime-busy-p': the latter reads nil for a
+;;; form that errored into SLDB, so the loop would exit announcing success.
 ;;;
 ;;; Every call returns instantly, so Emacs stays responsive while a system
 ;;; compiles or a test suite runs.
@@ -367,9 +423,11 @@ multi-line frames."
 
 (defun my/slime-sldb-abort ()
   "Invoke the ABORT restart in the active SLDB buffer, returning to the REPL.
-Use once the backtrace has been read, so the image is usable again -- until then
-the connection sits in the debugger and `my/slime-busy-p' stays t.  Returns
-\"aborted\" if a debugger was open, \"no-debugger\" otherwise."
+Use once the backtrace has been read, so the image is usable again.  Until then
+the connection sits in the debugger -- which `my/slime-busy-p' does NOT show
+\(it reads nil, as if idle); `my/slime-ready-p' and the :in-debugger flag of
+`my/slime-repl-status' are what detect it.  Returns \"aborted\" if a debugger
+was open, \"no-debugger\" otherwise."
   (let ((buf (my/slime-sldb-buffer)))
     (if (not buf)
         "no-debugger"
@@ -436,11 +494,15 @@ even from this single call."
 ;;; What DOES fire on exactly the transition we want is `slime-repl-insert-
 ;;; prompt': both the `:ok' and `:abort' listener continuations call it once the
 ;;; result is in and the prompt is redrawn, and it is NOT called while the form
-;;; is parked in SLDB -- the same boundary `my/slime-busy-p' already draws.  So
-;;; we advise it and expose `my/slime-repl-idle-functions', letting Emacs-side
-;;; code react to idle instead of polling.  The gate `(not (my/slime-busy-p))'
-;;; means that with several forms pipelined the hook runs only when the LAST one
-;;; drains, i.e. on the genuine idle edge.
+;;; is parked in SLDB -- a STRICTER boundary than `my/slime-busy-p' draws, since
+;;; that one already reads nil for a debugged form.  The idle signal is thus the
+;;; more trustworthy of the two: it fires on a genuine prompt return, never on
+;;; an error that merely stopped being "busy".  So we advise it and expose
+;;; `my/slime-repl-idle-functions', letting Emacs-side code react to idle
+;;; instead of polling.  The gate `(not (my/slime-busy-p))' means that with
+;;; several forms pipelined the hook runs only when the LAST one drains, i.e.
+;;; on the genuine idle edge.  (That gate is safe despite the SLDB blind spot:
+;;; the advice only runs when a prompt is actually being inserted.)
 ;;;
 ;;; For a shell driver that cannot receive an Elisp callback, `my/slime-send-
 ;;; then-touch' turns that edge into a file: send, then create PATH when the

@@ -74,7 +74,7 @@ The user may be interacting with the Lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-busy-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger.
+Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-ready-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger. Use `my/slime-ready-p` for this, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger.
 
 In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
 
@@ -98,15 +98,17 @@ Then:
 | Need | Call |
 |------|------|
 | which Emacs am I driving (target + path rules) | `(my/slime-host-info)` |
+| **is it safe to send?** (connected, idle, no debugger) | `(my/slime-ready-p)` |
 | stage without evaluating | `(my/slime-stage "FORM")` |
 | submit | `(my/slime-send "FORM")` |
+| stage/submit a form too big or too quoted to pass through `--eval` | `(my/slime-stage-file "/tmp/in.lisp")`, `(my/slime-send-file "/tmp/in.lisp")` |
 | submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
-| slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-busy-p)` from the shell, then `(my/slime-output-since-mark)` |
+| slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-ready-p)` from the shell, then `(my/slime-output-since-mark)` |
 | be *told* when idle instead of polling (sentinel file for the shell to wait on) | `(my/slime-send-then-touch "/tmp/done" "FORM")`, then `while [ ! -e /tmp/done ]; do sleep 0.2; done` |
-| submit + wait, output to a file (dodges escaping on noisy builds) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
-| output without escaping | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
+| submit + wait, output to a file (dodges the reply-size/escaping limit) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
+| output to a file rather than through `--eval` | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
 | read the backtrace after an interrupt | `(my/slime-sldb-backtrace)` / `(my/slime-sldb-backtrace-to-file "/tmp/bt.txt")` |
 | leave the debugger | `(my/slime-sldb-abort)` |
@@ -205,6 +207,55 @@ The one thing that differs between them is **paths**, because in the Windows cas
 
 The native target needs **no translation at all** — Emacs, the image, and the shell all speak the same Linux paths. The Windows target needs the dual-spelling dance on every path.
 
+> **On Windows, give ASDF/UIOP paths as `#p"…"` literals, never bare strings.**
+> Getting the *spelling* right (`C:/…`) is necessary but **not sufficient** once
+> the path reaches ASDF. This fails on a Windows image:
+>
+> ```lisp
+> (asdf:load-asd "C:/Users/you/src/foo/foo.asd")
+> ;; => Invalid pathname "C:/Users/you/src/foo/foo.asd":
+> ;;    Expected an absolute pathname
+> ```
+>
+> which looks impossible, because the image agrees the path *is* absolute:
+>
+> ```lisp
+> (uiop:absolute-pathname-p (pathname "C:/Users/you/src/foo/foo.asd"))  ; => T
+> ```
+>
+> The two calls disagree because they parse the string with **different
+> parsers**. `uiop:ensure-pathname` — which ASDF applies to path arguments, with
+> `:want-absolute t` — parses a *string* with `parse-unix-namestring` on every
+> platform, Windows included; its `namestring` argument defaults to `nil`:
+>
+> ```lisp
+> (setf p (case namestring
+>           ((:unix nil) (parse-unix-namestring p …))   ; <- the default, everywhere
+>           ((:native)   (parse-native-namestring p))
+>           ((:lisp)     (parse-namestring p))
+>           …))
+> ```
+>
+> Under Unix rules `C:/Users/…` has no leading `/`, so it parses **relative**,
+> with `C:` as an ordinary first directory component — `(:RELATIVE "C:" "Users" …)`
+> — and the `:want-absolute` check then raises. `(pathname "C:/…")`, by contrast,
+> uses the *host* parser, which on a Windows image understands `C:` as a device
+> and yields a genuinely absolute pathname.
+>
+> The fix is to hand ASDF a pathname it does not have to parse. `ensure-pathname`
+> passes an existing pathname through untouched, so a literal works:
+>
+> ```lisp
+> (asdf:load-asd #p"C:/Users/you/src/foo/foo.asd")            ; works
+> (push #p"C:/Users/you/src/foo/" asdf:*central-registry*)    ; likewise
+> ```
+>
+> Rule of thumb for the Windows target: **`#p"…"` for anything going into ASDF,
+> UIOP or `*central-registry*`.** Plain strings are still fine for `cl:load` and
+> for the Emacs-side helpers in this file, which never route through
+> `parse-unix-namestring`. On the native Linux target the question does not
+> arise — there is no device letter and both parsers agree.
+
 **Detection, statement, and choice (Claude does this at launch):**
 
 1. Probe both — a target "answers" only if its Emacs has `M-x server-start` running:
@@ -254,16 +305,37 @@ once and the shell does the waiting:
 ```elisp
 (my/slime-mark)                       ; remember where output starts
 (my/slime-send "(ql:quickload :my-system)")
-(my/slime-busy-p)                     ; poll this from the shell, sleeping there
+(my/slime-ready-p)                    ; poll this from the shell, sleeping there
 (my/slime-output-since-mark 2000)     ; collect the result
 
-;; …or, to avoid emacsclient's string escaping entirely — which you MUST when a
-;; recompile spews `redefining ...' warnings, since send-wait then trips
-;; "*ERROR*: Unknown message:" mid-stream — write straight to a file and cat it:
+;; …or, to bypass emacsclient's reply printer entirely — see the size warning
+;; below — write straight to a file and cat it:
 (my/slime-output-since-mark-to-file "/tmp/out.txt")
 (my/slime-send-wait-to-file "/tmp/out.txt" "(asdf:load-system :sys :force t)" 300)
 (my/slime-interrupt)                  ; stop a runaway form you started
 ```
+
+> **`*ERROR*: Unknown message:` — it is about reply *size*, not noisy builds.**
+> `emacsclient --eval` prints the result as an Elisp string literal, and past a
+> certain length the reply desynchronises mid-stream and emacsclient reports
+> `*ERROR*: Unknown message:`. A long build log trips it, but so do
+> innocuous-looking calls whose *return value* is large — `(push #p"…"
+> asdf:*central-registry*)` returns the whole registry, which is enough on its
+> own. The rule is: never let a big value come back **through** `--eval`.
+>
+> Both directions have a helper, and you need both:
+>
+> - **Replies out of Emacs** — `my/slime-send-wait-to-file`,
+>   `my/slime-output-since-mark-to-file`, `my/slime-repl-tail-to-file`,
+>   `my/slime-sldb-backtrace-to-file`. The helper returns just the path; the
+>   shell `cat`s plain UTF-8, with no escaping and no size limit.
+> - **Forms into Emacs** — `my/slime-stage-file` and `my/slime-send-file` read
+>   the form from a file, so a long or heavily-quoted form never has to survive
+>   shell quoting *and* Elisp string quoting on the way in.
+>
+> When the value is genuinely large but you only wanted a summary, the cheaper
+> fix is to not return it: end the form with something small, e.g.
+> `(progn (push #p"…" asdf:*central-registry*) (length asdf:*central-registry*))`.
 
 > **Path note for the file helpers:** on a **native Linux Emacs** the file path
 > is the same for Emacs and the shell (`/tmp/out.txt` works as written). On a
@@ -295,9 +367,14 @@ while [ ! -e /tmp/done ]; do sleep 0.2; done      # woken by the prompt returnin
 
 (The same Windows path caveat as above applies to the `/tmp/done` sentinel.)
 
-It rides the same prompt-return edge as everything else, so it does **not** fire
-while a form is parked in SLDB (matching `my/slime-busy-p`), and the one-shot is
-armed *before* the form is sent so a fast form cannot finish first. One caveat: a
+It rides the prompt-return edge, so it does **not** fire while a form is parked
+in SLDB — a *stricter* and more trustworthy test than `my/slime-busy-p`, which
+already reads `nil` for a debugged form. The flip side is that a form that errors
+into SLDB will never touch the sentinel file, so a shell `while [ ! -e /tmp/done ]`
+loop blocks until you abort the debugger; give it a timeout, or pair it with
+`my/slime-send-capturing` so errors never reach SLDB in the first place. The
+one-shot is armed *before* the form is sent so a fast form cannot finish first.
+One caveat: a
 package switch also redraws the prompt, so keep idle functions cheap and
 idempotent. This is a REPL-input signal — for arbitrary background RPCs
 (`slime-eval-async`) you would hook `slime-event-hooks` instead.
@@ -327,7 +404,7 @@ recover with:
 (my/slime-sldb-abort)                 ; back to the top-level REPL prompt
 ```
 
-Five things worth knowing about this file, each learned the hard way:
+Six things worth knowing about this file, each learned the hard way:
 
 - **Silent `slime-eval` is the wrong tool here.** SLIME's own `slime-eval` runs a
   form over the socket and returns the value but writes **nothing** to the REPL
@@ -345,6 +422,13 @@ Five things worth knowing about this file, each learned the hard way:
   through `emacsclient --eval`. A shell poll testing `= "nil"` then never
   matches and the caller waits forever — which is exactly what the workflow
   above tells it to do. The helper coerces to a strict boolean for this reason.
+- **…but "not busy" is not "ready": `slime-busy-p` ignores debugged requests.**
+  Its docstring says so outright, and it filters out
+  `sldb-debugged-continuations`, so a form parked in SLDB is indistinguishable
+  from one that completed. Polling `busy-p` alone makes a driver announce
+  success and fire the next form into a debugger. `my/slime-ready-p` (connected
+  **and** idle **and** no SLDB) is the precondition to poll; `busy-p` keeps its
+  narrow meaning so existing two-valued shell tests stay correct.
 - **`slime-repl-kill-input` kills "from the prompt to point"**, so staging after
   `(goto-char (point-max))` silently discards whatever the user was half-way
   through typing. It lands in the kill ring, but nothing says so. `my/slime-stage`
@@ -398,9 +482,11 @@ and `(sb-ext:restrict-compiler-policy 'speed 0 3)` (max back to 3).
 ### Catch errors instead of dropping into SLDB
 
 When a form errors, SLIME opens an **SLDB** debugger buffer and the evaluation
-blocks there — and `my/slime-busy-p` stays `t` the whole time, so a shell poll
-loop waits forever. For a driver that fires and reports, it is usually better to
-keep the error *in* the REPL. `my/slime-send-capturing` wraps the form so any
+blocks there — and the failure mode for a shell driver is the *opposite* of a
+hang: `my/slime-busy-p` goes **`nil`** the moment the form is debugged (see the
+box below), so a poll loop cheerfully reports the REPL idle and the driver fires
+its next form into an open debugger. For a driver that fires and reports, it is
+usually better to keep the error *in* the REPL. `my/slime-send-capturing` wraps the form so any
 `error` prints its type, message and a backtrace, then returns `:error` instead
 of entering the debugger:
 
@@ -416,14 +502,49 @@ and conditions that are not `error` subtypes, still reach SLDB as usual. For the
 richest backtrace, raise the debug policy (above) before you recompile the code
 under test.
 
+> **`my/slime-busy-p` does not see SLDB — poll `my/slime-ready-p` instead.**
+> This is the single most misleading thing about the polling workflow, so it is
+> worth stating precisely. SLIME's own `slime-busy-p` is documented *"True if
+> Lisp has outstanding requests. **Debugged requests are ignored**"*, and its
+> body removes exactly the continuations that `sldb-debugged-continuations`
+> reports:
+>
+> ```elisp
+> (defun slime-busy-p (&optional conn)
+>   "True if Lisp has outstanding requests.
+> Debugged requests are ignored."
+>   (let ((debugged (sldb-debugged-continuations (or conn (slime-connection)))))
+>     (cl-remove-if (lambda (id) (memq id debugged))
+>                   (slime-rex-continuations) :key #'car)))
+> ```
+>
+> So a form that died into SLDB reads **identically to one that finished
+> cleanly**. The danger is therefore not a poll loop that hangs forever — it is
+> a driver that reports success and sends the next form into a debugger, where
+> it is silently swallowed.
+>
+> `my/slime-ready-p` is the correct precondition: it is `t` only when SLIME is
+> connected, not busy, **and** no SLDB buffer is open. `my/slime-busy-p` keeps
+> its narrow busy/not-busy meaning on purpose — a shell poll loop needs a
+> two-valued answer, and widening it to a third value like `:debugger` would
+> break every `[ "$x" = "nil" ]` test already written against it.
+>
+> Two related consequences: `my/slime-send-wait` returns an explicit
+> `[SLDB -- evaluation parked in the debugger]` marker rather than pretending the
+> form completed; and `my/slime-send-then-touch` *does* block indefinitely on an
+> SLDB park, because it rides the prompt-return edge, which a debugged form never
+> reaches until you abort. That sentinel file is the one place where "waits
+> forever" is the true failure mode.
+
 ### Interrupt a hang, then read the backtrace
 
 `my/slime-send-capturing` does **not** help when a form *hangs* rather than
 errors: interrupting it (`my/slime-interrupt`, = `C-c C-c`) raises
 `sb-sys:interactive-interrupt`, which is a `serious-condition` but **not** an
 `error`, so no `handler-bind` on `error` catches it — it always drops into SLDB.
-And while the connection sits in SLDB, `my/slime-busy-p` stays `t`, so a shell
-poll loop would wait forever. Three helpers reach the debugger buffer that the
+And once the connection sits in SLDB, `my/slime-busy-p` reads `nil` (see the box
+above), so a shell poll loop concludes the REPL is free while it is in fact
+parked at a debugger prompt. Three helpers reach the debugger buffer that the
 REPL-reading helpers never touch:
 
 ```elisp
@@ -432,8 +553,11 @@ REPL-reading helpers never touch:
 (my/slime-sldb-abort)            ; invoke ABORT, returning to the top-level prompt
 ```
 
-`my/slime-repl-status` also reports an `:in-debugger` flag so one call tells you
-the connection is parked in SLDB. To avoid `emacsclient`'s newline escaping on
+`my/slime-repl-status` also reports an `:in-debugger` flag — computed from the
+SLDB buffer, not from the continuation list — so one call tells you the
+connection is parked in SLDB even though `:busy` reads `nil`. It is the
+diagnostic counterpart to `my/slime-ready-p`: poll `ready-p` for a two-valued
+answer, call `repl-status` when you need to know *why* it said `nil`. To avoid `emacsclient`'s newline escaping on
 the multi-line frames, write the backtrace straight to a file with
 `my/slime-sldb-backtrace-to-file` and read it from the shell.
 
@@ -471,7 +595,9 @@ returns on its own:
 The backtrace is taken at the hang (via `handler-bind`, before unwinding), just
 like the interrupt path, and the same wrapper also catches an `error` if the form
 blows up first — the form returns `:timed-out` or `:error`. Because the image is
-never parked in SLDB, `my/slime-busy-p` never gets stuck at `t`. Keep
+never parked in SLDB, the busy/idle signal stays *meaningful*: idle really does
+mean finished, and the prompt-return helpers (`my/slime-send-then-touch`, the
+idle hook) fire as they should. Keep
 `my/slime-interrupt` for stopping something *already* running that you did not
 launch through `send-timed`.
 
@@ -662,7 +788,7 @@ The user may be interacting with the lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-busy-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger.
+Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-ready-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger. Use `my/slime-ready-p` for this, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger.
 
 Paths sent to the image must be in WSL form (`/mnt/c/...`), since the SBCL image runs in Linux. Paths sent to Emacs itself (`load-file` etc.) must be in Windows form (`C:/...`).
 
@@ -680,7 +806,7 @@ The staging/sending/reading helpers are in [`slime-bridge.el`](slime-bridge.el).
 emacsclient --eval '(load-file "/path/to/claude-lisp-repl/slime-bridge.el")'
 ```
 
-The helper calls are the same as the main recipe (see its "Helper functions" section for the full table and cautions): `my/slime-stage` / `my/slime-send` to stage and submit; `my/slime-send-wait` to read a result back; `my/slime-send-capturing` / `my/slime-send-timed` to keep an error or a hang in the REPL instead of SLDB; the `my/slime-mark` → poll `my/slime-busy-p` → `my/slime-output-since-mark` sequence for slow work; `my/slime-interrupt` / `my/slime-sldb-backtrace` / `my/slime-sldb-abort` after a hang; and `my/slime-repl-status` to see where you are. Same cautions too: do not use `my/slime-send-wait` for slow work (it freezes Emacs in `sleep-for` — poll from the shell instead), and expect a big `:serial t` recompile to sit silent for minutes yet be healthy (judge by whether `:tail` is moving, not elapsed time).
+The helper calls are the same as the main recipe (see its "Helper functions" section for the full table and cautions): `my/slime-stage` / `my/slime-send` to stage and submit; `my/slime-send-wait` to read a result back; `my/slime-send-capturing` / `my/slime-send-timed` to keep an error or a hang in the REPL instead of SLDB; the `my/slime-mark` → poll `my/slime-ready-p` → `my/slime-output-since-mark` sequence for slow work; `my/slime-interrupt` / `my/slime-sldb-backtrace` / `my/slime-sldb-abort` after a hang; and `my/slime-repl-status` to see where you are. Same cautions too: do not use `my/slime-send-wait` for slow work (it freezes Emacs in `sleep-for` — poll from the shell instead); poll `my/slime-ready-p` rather than `my/slime-busy-p`, since the latter reads `nil` for a form parked in SLDB and would report an errored form as a finished one; and expect a big `:serial t` recompile to sit silent for minutes yet be healthy (judge by whether `:tail` is moving, not elapsed time).
 
 If you find better variants, tell me so I can improve this prompt.
 ````
