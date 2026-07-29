@@ -27,12 +27,14 @@
 ;;   * Everything lands as real REPL input, so it appears in the user's history
 ;;     and scrollback exactly as if they had typed it.
 ;;
-;; Usage convention (see the README prompts): stage or send, then report and
-;; stop.  The user is watching the REPL, so reading results back is wasted
-;; effort unless they ask for them.  `my/slime-ready-p' before sending a NEW
-;; form is the exception -- a precondition check, not result analysis.  Use
-;; `my/slime-ready-p', NOT `my/slime-busy-p': the latter reports a form parked
-;; in SLDB as idle (see its docstring), so it cannot detect an open debugger.
+;; Usage convention (see the README prompts): send, then read the result back
+;; and report it -- mark, send, poll `my/slime-ready-p' from the shell, then
+;; `my/slime-output-since-mark'.  Staging is the exception: a staged form has
+;; not run, so report "staged" and leave the prompt alone rather than polling
+;; it (that races the user's RET).  Poll `my/slime-ready-p', NOT
+;; `my/slime-busy-p': the latter reports a form parked in SLDB as idle (see its
+;; docstring), so it cannot detect an open debugger and would have you read an
+;; errored form as a finished one.
 
 ;;; Code:
 

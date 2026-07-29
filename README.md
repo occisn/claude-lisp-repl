@@ -74,7 +74,7 @@ The user may be interacting with the Lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-ready-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger. Use `my/slime-ready-p` for this, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger.
+Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result. Mark before you send (`(my/slime-mark)`), poll `(my/slime-ready-p)` from the shell until the form has finished, then read the output (`(my/slime-output-since-mark)`) and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter. Poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
 
 In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
 
@@ -120,7 +120,7 @@ Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`, w
 
 Expect slow to look like stuck. Touching a file near the root of a `:serial t` ASDF system makes every downstream file recompile, so a `test-system` can sit silent for many minutes and be perfectly healthy. Judge by whether `(my/slime-repl-status)`'s `:tail` is *moving*, not by elapsed time — and if it really is wedged, `(my/slime-interrupt)` ends it without touching the user's window.
 
-In day-to-day use you will reach for `my/slime-stage` and `my/slime-send` far more than the reading helpers: the user is watching the REPL, so the default is to fire and report rather than to read results back. The reading helpers earn their place when the user *asks* for output, and when a long build needs watching without freezing Emacs.
+In day-to-day use, sending and reading back go together: `my/slime-stage` / `my/slime-send` put the form in the REPL where the user can see it, and the reading helpers are how you then find out what it did. The usual shape for anything non-trivial is `my/slime-mark` → `my/slime-send` → poll `my/slime-ready-p` from the shell → `my/slime-output-since-mark`. Staging is the one case with nothing to read back: a staged form has not run yet, so report "staged" and leave the prompt alone.
 
 If you find better variants, tell me so I can improve this prompt.
 ````
@@ -685,7 +685,7 @@ The user may be interacting with the lisp image through the REPL on its own, ind
 
 In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
 
-Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not keep capturing the pane to read and analyse the output — I am watching the REPL myself. Use `capture-pane` only to confirm the prompt has returned before you send the next instruction. Collect and interpret output only when I explicitly ask for it.
+Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result. Capture the pane until the prompt has returned, read the output, and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed.
 ```
 
 **Step 2** — Open the tmux session from a terminal:
@@ -788,7 +788,7 @@ The user may be interacting with the lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Fire and report: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and tell me "sent". Do not poll, do not wait for the evaluation to finish, and do not fetch the output to analyse it — I am watching the REPL and can already see the result. Collect and interpret output only when I explicitly ask ("what did that return?"). After staging, leave the prompt alone: checking whether the staged form is still pending just races my RET. One `(my/slime-ready-p)` call before sending a *new* form is fine — that is a precondition check, not result analysis, and it stops you firing into a busy REPL or an open SLDB debugger. Use `my/slime-ready-p` for this, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger.
+Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result. Mark before you send (`(my/slime-mark)`), poll `(my/slime-ready-p)` from the shell until the form has finished, then read the output (`(my/slime-output-since-mark)`) and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter. Poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
 
 Paths sent to the image must be in WSL form (`/mnt/c/...`), since the SBCL image runs in Linux. Paths sent to Emacs itself (`load-file` etc.) must be in Windows form (`C:/...`).
 
