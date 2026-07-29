@@ -28,13 +28,31 @@
 ;;     and scrollback exactly as if they had typed it.
 ;;
 ;; Usage convention (see the README prompts): send, then read the result back
-;; and report it -- mark, send, poll `my/slime-ready-p' from the shell, then
-;; `my/slime-output-since-mark'.  Staging is the exception: a staged form has
-;; not run, so report "staged" and leave the prompt alone rather than polling
-;; it (that races the user's RET).  Poll `my/slime-ready-p', NOT
+;; and report it.  Which waiting shape depends on how long the form runs:
+;;
+;;   * SHORT forms -- `my/slime-mark', `my/slime-send', a few polls of
+;;     `my/slime-ready-p' from the shell, `my/slime-output-since-mark'.
+;;   * ANYTHING SLOW (load-system, test-system, quickload) -- do NOT poll.  Use
+;;     `my/slime-send-capturing-then-touch' and let the shell BLOCK on the
+;;     sentinel file.  A poll loop is a long-lived shell command, and an agent
+;;     harness caps how long one command may run (Claude Code's Bash tool: 10
+;;     minutes), so the loop is killed mid-watch and the driver never learns
+;;     the form finished.  A `while [ ! -e SENTINEL ]' wait is far cheaper,
+;;     survives much longer, is trivially bounded, and is RESUMABLE -- the
+;;     sentinel persists, so re-running the wait picks it back up.
+;;
+;; Staging is the exception to reading back: a staged form has not run, so
+;; report "staged" and leave the prompt alone rather than polling it (that
+;; races the user's RET).  When you do poll, poll `my/slime-ready-p', NOT
 ;; `my/slime-busy-p': the latter reports a form parked in SLDB as idle (see its
 ;; docstring), so it cannot detect an open debugger and would have you read an
 ;; errored form as a finished one.
+;;
+;; Restarting the image is a normal, self-service operation -- see
+;; `my/slime-restart-and-wait'.  It is cheap and fully recoverable, so a driver
+;; should do it rather than ask, whenever a stale image would lie: changed
+;; `defstruct'/`defclass' slots, stale ftype/export proclamations after a
+;; rename, or verifying a genuinely cold load.
 
 ;;; Code:
 
@@ -137,6 +155,26 @@ The forms run as visible REPL input and land in the SLIME history."
 ;;; performs the unwind cleanly.  SBCL-specific (`sb-debug:print-backtrace').
 ;;; ---------------------------------------------------------------------------
 
+(defun my/slime--capture-wrap (code &optional n-frames)
+  "Return CODE as a form that self-reports an ERROR instead of opening SLDB.
+On error the wrapped form prints \"; CONDITION <type>: <message>\" followed by up
+to N-FRAMES backtrace frames (default 20) and returns `:error'; on success it
+returns CODE's own value unchanged.  Split out from `my/slime-send-capturing' so
+the same wrapper can be combined with the sentinel signal -- see
+`my/slime-send-capturing-then-touch', which is the pairing that matters: a form
+that errors into SLDB never returns the prompt, so it would never touch the
+sentinel and the shell would wait forever."
+  (format
+   (concat "(block my/slime--capture\n"
+           "  (handler-bind\n"
+           "      ((error (lambda (c)\n"
+           "                (format t \"~&; CONDITION ~s: ~a~%%\" (type-of c) c)\n"
+           "                (ignore-errors\n"
+           "                  (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
+           "                (return-from my/slime--capture (values :error c)))))\n"
+           "    %s))")
+   (or n-frames 20) code))
+
 (defun my/slime-send-capturing (code &optional n-frames force)
   "Send CODE wrapped so any ERROR self-reports in the REPL instead of opening SLDB.
 On error the REPL prints \"; CONDITION <type>: <message>\" followed by up to
@@ -144,19 +182,11 @@ N-FRAMES backtrace frames (default 20) and the form returns `:error'; on success
 CODE's own value is returned unchanged.  Like `my/slime-send' this returns
 \"sent\" immediately -- watch the REPL (or use the mark/poll/read helpers) for
 the result.  Note the wrapper only traps `error'; conditions that are not
-`error' subtypes, and a deliberate C-c interrupt, still reach SLDB as usual."
-  (my/slime-send
-   (format
-    (concat "(block my/slime--capture\n"
-            "  (handler-bind\n"
-            "      ((error (lambda (c)\n"
-            "                (format t \"~&; CONDITION ~s: ~a~%%\" (type-of c) c)\n"
-            "                (ignore-errors\n"
-            "                  (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
-            "                (return-from my/slime--capture (values :error c)))))\n"
-            "    %s))")
-    (or n-frames 20) code)
-   force))
+`error' subtypes, and a deliberate C-c interrupt, still reach SLDB as usual.
+
+For slow work, prefer `my/slime-send-capturing-then-touch', which adds the
+done-sentinel so the shell can block instead of poll."
+  (my/slime-send (my/slime--capture-wrap code n-frames) force))
 
 (defun my/slime-send-timed (code seconds &optional n-frames force)
   "Send CODE wrapped in `sb-ext:with-timeout' so a HANG self-reports in the REPL.
@@ -355,6 +385,19 @@ slow use the mark/send/poll/read sequence below instead."
     (with-temp-file path (insert string)))
   path)
 
+(defun my/slime--write-atomically (string path)
+  "Write STRING to PATH via a temporary file and a rename.  Return PATH.
+Matters for the done-sentinel specifically: the shell's wait is
+`while [ ! -e PATH ]', so the instant PATH exists the driver reads it.  Writing
+in place would let that read catch a half-written file; a rename is atomic
+within a filesystem, so PATH never exists with partial contents.  The temporary
+lives at PATH.tmp -- next to PATH, hence same filesystem, and not itself matched
+by a wait on PATH."
+  (let ((tmp (concat path ".tmp")))
+    (my/slime-write-string-to-file string tmp)
+    (rename-file tmp path t)
+    path))
+
 (defun my/slime-send-wait-to-file (path code &optional timeout-seconds n-chars force)
   "Like `my/slime-send-wait' but write the captured output to PATH instead of
 returning it.  Return PATH.
@@ -462,7 +505,9 @@ confirm and announce which target you are driving."
   "One-call summary: target, connection, REPL buffer, package, busy state, tail.
 `:emacs-system-type' and `:path-style' identify which Emacs (Windows or Linux)
 is answering -- see `my/slime-host-info' -- so the caller can pick path rules
-even from this single call."
+even from this single call.  `:can-restart' says whether Emacs started this
+image itself and can therefore restart it (`my/slime-restart-and-wait'); it is
+nil for an image reached with `M-x slime-connect'."
   (if (not (and (fboundp 'slime-connected-p) (slime-connected-p)))
       (list :connected nil
             :emacs-system-type system-type
@@ -476,6 +521,7 @@ even from this single call."
           :package (ignore-errors (slime-current-package))
           :busy (and (my/slime-busy-p) t)
           :in-debugger (and (my/slime-sldb-buffer) t)
+          :can-restart (and (ignore-errors (slime-inferior-process)) t)
           :visible (and (get-buffer-window (slime-output-buffer) 0) t)
           :pending-input (my/slime-pending-input)
           :tail (string-trim (my/slime-repl-tail 200)))))
@@ -522,10 +568,22 @@ corrupt SLIME's prompt handling.  Note the prompt is also redrawn on a package
 switch (`slime-repl-set-package'), so a stray idle-edge is possible; keep the
 functions cheap and idempotent.")
 
+(defvar my/slime--prompt-inserts 0
+  "Count of `slime-repl-insert-prompt' calls since this file was loaded.
+Incremented by `my/slime--run-idle-functions' BEFORE the idle gate, so it counts
+every prompt redraw -- including the ones that do not fire the idle hook (the
+Lisp still busy) and the ones that are not evaluation results at all (a package
+switch redraws the prompt too).  The difference between two readings is what
+lets a sentinel say how many times the prompt came back while it was armed: 1
+is a clean single completion, more than 1 means something else redrew the
+prompt as well.")
+
 (defun my/slime--run-idle-functions (&rest _)
   "Run `my/slime-repl-idle-functions' when connected and not busy.
 Advice target: `slime-repl-insert-prompt'.  Always returns nil and never
-signals, so it cannot alter or break prompt insertion."
+signals, so it cannot alter or break prompt insertion.  Bumps
+`my/slime--prompt-inserts' unconditionally, before the gate."
+  (setq my/slime--prompt-inserts (1+ my/slime--prompt-inserts))
   (when (and (fboundp 'slime-connected-p)
              (ignore-errors (slime-connected-p))
              (not (my/slime-busy-p)))
@@ -549,24 +607,211 @@ itself before calling FN, so a re-entrant FN cannot re-trigger it."
     (add-hook 'my/slime-repl-idle-functions entry)
     entry))
 
+(defun my/slime--write-sentinel (path armed-at armed-prompts start-pos)
+  "Write the done-sentinel PATH with evidence about how it came to fire.
+
+ARMED-AT is a `float-time' taken when the one-shot was armed, ARMED-PROMPTS the
+`my/slime--prompt-inserts' reading at that moment, and START-POS the REPL buffer
+position just after the form was submitted.  The file gets ONE readable line:
+
+  (:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)
+
+  :elapsed-ms      wall time from arming to the prompt returning.
+  :prompt-returns  prompt redraws while armed.  A clean single completion is 1.
+  :output-chars    characters the REPL gained since the form was submitted.
+  :suspect         t when :prompt-returns is above 1 -- something redrew the
+                   prompt besides the result, a package switch being the
+                   documented case, so the fire may not be this form finishing.
+
+Elapsed time alone cannot answer \"did my form really finish?\", because a fast
+completion and a spurious redraw both return instantly; the other three fields
+are what separate them.  A 0 ms fire with :output-chars 0 and :suspect t is a
+redraw; a 200 ms fire with thousands of characters of output is a warm cache
+doing exactly what it should.
+
+Written atomically, so a shell that sees PATH appear never reads a partial line.
+Never signals: an unreadable REPL buffer degrades to :output-chars -1, because
+failing to write the sentinel would hang the waiting shell -- a far worse
+outcome than a missing number."
+  (let* ((elapsed-ms (round (* 1000 (- (float-time) armed-at))))
+         (returns (- my/slime--prompt-inserts armed-prompts))
+         (chars (condition-case nil
+                    (with-current-buffer (slime-output-buffer)
+                      (max 0 (- (point-max) start-pos)))
+                  (error -1))))
+    (my/slime--write-atomically
+     (format
+      "(:done t :elapsed-ms %d :prompt-returns %d :output-chars %d :suspect %s)\n"
+      elapsed-ms returns chars (if (> returns 1) "t" "nil"))
+     path)))
+
 (defun my/slime-send-then-touch (path code &optional force)
   "Send CODE via the REPL, then create/overwrite PATH when the prompt returns.
-Lets a shell driver BLOCK on PATH appearing (e.g. `while [ ! -e PATH ]; do
-sleep 0.1; done') instead of re-polling `my/slime-busy-p'.  The one-shot is
-armed BEFORE sending so a fast form cannot finish first; if `my/slime-send'
-signals (e.g. unsent input at the prompt and FORCE nil) the one-shot is removed
-and the error re-raised, so PATH is never touched for a form that did not run.
-Returns \"sent\" immediately, like `my/slime-send'; PATH's contents are empty --
-it is a done-sentinel, not the result.  For the result, mark first and read
-`my/slime-output-since-mark-to-file' once PATH shows up."
-  (let ((entry (my/slime-run-once-when-idle
-                (lambda () (my/slime-write-string-to-file "" path)))))
+This -- not a poll loop -- is the default shape for anything slow: the shell
+BLOCKS on PATH appearing (`while [ ! -e PATH ]; do sleep 2; done') instead of
+re-running `emacsclient' every few seconds.  A poll loop is a long-lived shell
+command, and agent harnesses cap how long one command may run, so the loop gets
+killed mid-watch and the driver silently stops watching; a blocking wait is far
+cheaper, survives much longer, and re-running it simply resumes the wait.
+
+Any PRE-EXISTING PATH is deleted before the one-shot is armed, so a sentinel
+left over from an earlier call cannot make the next wait return instantly.
+The one-shot is armed BEFORE sending so a fast form cannot finish first; if
+`my/slime-send' signals (e.g. unsent input at the prompt and FORCE nil) the
+one-shot is removed and the error re-raised, so PATH is never touched for a
+form that did not run.
+
+Returns \"sent\" immediately, like `my/slime-send'.  PATH is still a
+done-sentinel rather than the result -- read the result with
+`my/slime-output-since-mark-to-file' -- but it is not silent about HOW it fired:
+it holds one readable line of evidence, written atomically (see
+`my/slime--write-sentinel'), e.g.
+
+  (:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)
+
+so `cat PATH' after the wait distinguishes a genuinely fast completion (warm
+fasl cache, nothing to recompile) from a prompt redraw that fired the one-shot
+early.  Without it a 0-second return on a `ql:quickload' is indistinguishable
+from a spurious one, and the honest driver wastes a round trip re-checking
+`my/slime-repl-status' -- or, worse, distrusts a real result.
+
+CAUTION: it rides the prompt-return edge, so a form that errors into SLDB never
+touches PATH and the wait blocks until you abort the debugger.  Bound the shell
+wait, and prefer `my/slime-send-capturing-then-touch', which removes the failure
+mode instead of merely bounding it."
+  (when (file-exists-p path)
+    (delete-file path))
+  (let* ((armed-at (float-time))
+         (armed-prompts my/slime--prompt-inserts)
+         ;; Reset to the post-send position below, so the echoed input form
+         ;; itself is not counted as output.
+         (start-pos (with-current-buffer (my/slime-assert-connected) (point-max)))
+         (entry (my/slime-run-once-when-idle
+                 (lambda ()
+                   (my/slime--write-sentinel path armed-at armed-prompts
+                                             start-pos)))))
     (condition-case err
-        (my/slime-send code force)
+        (progn
+          (my/slime-send code force)
+          ;; No process output can arrive between the send and this setq --
+          ;; nothing here yields to the filter -- so the one-shot cannot fire
+          ;; with the stale position.
+          (setq start-pos
+                (with-current-buffer (slime-output-buffer) (point-max))))
       (error
        (remove-hook 'my/slime-repl-idle-functions entry)
        (signal (car err) (cdr err)))))
   "sent")
+
+(defun my/slime-send-capturing-then-touch (path code &optional n-frames force)
+  "Send CODE so that errors stay in the REPL and PATH is touched when it is done.
+The default call for long-running work, because it composes the two halves that
+have to go together:
+
+  * `my/slime--capture-wrap' keeps an `error' in the REPL (condition, message,
+    N-FRAMES backtrace frames, return value `:error') instead of parking the
+    evaluation in SLDB; and
+  * `my/slime-send-then-touch' creates PATH on the prompt-return edge.
+
+Used separately, the sentinel has a nasty failure mode: a form that drops into
+SLDB never returns the prompt, so PATH is never created and a shell
+`while [ ! -e PATH ]' blocks until a human aborts the debugger.  Capturing the
+error means the prompt always comes back -- with `:error' and a backtrace in the
+output -- so the wait always ends.  Returns \"sent\" immediately.  Mark first
+\(`my/slime-mark') and read `my/slime-output-since-mark-to-file' once PATH
+appears."
+  (my/slime-send-then-touch path (my/slime--capture-wrap code n-frames) force))
+
+;;; ---------------------------------------------------------------------------
+;;; Restarting the image
+;;;
+;;; A stale image lies: `defstruct'/`defclass' slot changes leave old accessors
+;;; and instances behind, a renamed or deleted function leaves its ftype and
+;;; export proclamations in the package, and a system that only loads because
+;;; something earlier defined a symbol will not load cold.  Restarting costs a
+;;; re-load and whatever in-image state was built up, and nothing else -- so a
+;;; driver should just do it rather than stall waiting for permission.
+;;;
+;;; The reconnect is itself a wait, i.e. exactly the thing a poll loop gets
+;;; wrong, so it lives here rather than in a driver's shell script.
+;;; ---------------------------------------------------------------------------
+
+(defun my/slime--connection ()
+  "Return the live SLIME connection object, or nil when nothing is connected."
+  (and (fboundp 'slime-connected-p)
+       (ignore-errors (slime-connected-p))
+       (ignore-errors (slime-connection))))
+
+(defun my/slime-restart-and-wait (&optional timeout-seconds load-form sentinel-path)
+  "Restart the inferior Lisp, wait for the new REPL, and optionally re-load.
+
+Returns a plist -- `:restarted', `:connected', `:elapsed', `:repl-buffer',
+`:load-sent', `:sentinel', and `:error' if the re-load could not be sent.
+
+TIMEOUT-SECONDS (default 60) bounds the wait for the NEW connection; readiness
+means a connection object different from the old one plus `my/slime-ready-p',
+so a lingering old connection cannot be mistaken for the restarted image.
+
+LOAD-FORM, when given, is a Lisp string sent into the fresh image as visible
+REPL input (via `my/slime-send-capturing', so a load error self-reports instead
+of opening SLDB) -- typically \"(asdf:load-system :my-system)\".  It is NOT
+waited for: a system load is slow, and blocking Emacs on it is the mistake this
+file exists to avoid.  Pass SENTINEL-PATH to have the prompt-return touch that
+file, then block on it from the shell as usual.  `my/slime-mark' is called just
+before the load is sent, so `my/slime-output-since-mark' reads exactly the load
+output.
+
+Blocking Emacs in `sleep-for' is acceptable HERE, unlike in
+`my/slime-send-wait': an SBCL restart takes a couple of seconds, and everything
+slow that follows is sent asynchronously.
+
+Signals a `user-error' when Emacs has no inferior Lisp process -- i.e. the image
+was reached with `M-x slime-connect' (Annex B: SBCL running under tmux), where
+Emacs did not start it and cannot restart it.  Restart it where it runs, or ask
+the user.  Check `my/slime-ready-p' first if you want to be sure you are not
+killing a form the user launched; the restart kills the image either way."
+  (unless (fboundp 'slime-restart-inferior-lisp)
+    (user-error "SLIME is not loaded in this Emacs"))
+  (unless (ignore-errors (slime-inferior-process))
+    (user-error (concat "No inferior Lisp process: Emacs did not start this "
+                        "image (M-x slime-connect), so it cannot restart it")))
+  (let* ((old (my/slime--connection))
+         (start (float-time))
+         (deadline (+ start (or timeout-seconds 60)))
+         ready)
+    (setq my/slime--mark nil)           ; the old mark points into the old REPL
+    (slime-restart-inferior-lisp)
+    (while (and (not (setq ready
+                           (let ((conn (my/slime--connection)))
+                             (and conn (not (eq conn old))
+                                  (my/slime-ready-p)))))
+                (< (float-time) deadline))
+      (sleep-for 0.1))
+    ;; Let SLIME's own connected-hooks finish creating/initialising the REPL
+    ;; buffer before anything is sent into it.
+    (when ready (sleep-for 0.3))
+    (let ((elapsed (/ (round (* 10 (- (float-time) start))) 10.0))
+          (buf (and ready (ignore-errors (buffer-name (slime-output-buffer)))))
+          load-sent load-error)
+      (when (and ready load-form)
+        (condition-case err
+            (progn
+              (my/slime-mark)
+              (if sentinel-path
+                  (my/slime-send-capturing-then-touch sentinel-path load-form)
+                (my/slime-send-capturing load-form))
+              (setq load-sent load-form))
+          (error (setq load-error (error-message-string err)))))
+      (append
+       (list :restarted t
+             :connected (and ready t)
+             :elapsed elapsed
+             :repl-buffer buf
+             :load-sent load-sent)
+       (when (and load-sent sentinel-path) (list :sentinel sentinel-path))
+       (when load-error (list :error load-error))
+       (unless ready
+         (list :error (format "no new SLIME connection after %s s" elapsed)))))))
 
 (provide 'slime-bridge)
 ;;; slime-bridge.el ends here

@@ -14,7 +14,7 @@ The **main recipe** drives an **Emacs/SLIME** REPL and works against **either a 
 
 A recurring convention across all recipes: **"stage"** means *send instructions to the REPL without executing them* (no `Enter`) — so you can review or tweak before evaluating.
 
-The main recipe and Annex B share one set of elisp helpers, [`slime-bridge.el`](slime-bridge.el), covering staging, submitting, waiting for the prompt, reading output back, reporting which Emacs answered, and signalling when the REPL falls idle — see [Helper functions](#helper-functions).
+The main recipe and Annex B share one set of elisp helpers, [`slime-bridge.el`](slime-bridge.el), covering staging, submitting, waiting for the prompt, reading output back, reporting which Emacs answered, signalling when the REPL falls idle, and restarting the image — see [Helper functions](#helper-functions), [Long-running work](#long-running-work-be-told-dont-poll) and [Restarting the image](#restarting-the-image).
 
 Any comment? Open an [issue](https://github.com/occisn/claude-lisp-repl/issues), or start a discussion [here](https://github.com/occisn/claude-lisp-repl/discussions) or [at profile level](https://github.com/occisn/occisn/discussions).
 
@@ -33,6 +33,8 @@ The main recipe and Annex B also use [`slime-bridge.el`](slime-bridge.el) from t
 - [Driving an Emacs/SLIME REPL (Windows or Linux)](#driving-an-emacsslime-repl-windows-or-linux)
 - [Targets: Windows or Linux Emacs](#targets-windows-or-linux-emacs)
 - [Helper functions](#helper-functions)
+- [Long-running work: be told, don't poll](#long-running-work-be-told-dont-poll)
+- [Restarting the image](#restarting-the-image)
 - [Compilation policy and catching errors](#compilation-policy-and-catching-errors)
 - [Annex A — tmux REPL, no Emacs](#annex-a--tmux-repl-no-emacs)
 - [Annex B — tmux image behind a separate Emacs](#annex-b--tmux-image-behind-a-separate-emacs)
@@ -74,7 +76,50 @@ The user may be interacting with the Lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result. Mark before you send (`(my/slime-mark)`), poll `(my/slime-ready-p)` from the shell until the form has finished, then read the output (`(my/slime-output-since-mark)`) and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter. Poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
+Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter.
+
+HOW you wait depends on how long the form runs:
+
+- SHORT forms (a definition, a quick call): mark, send, poll a few times, read — `(my/slime-mark)`, `(my/slime-send "FORM")`, `(my/slime-ready-p)` from the shell until it says `t`, then `(my/slime-output-since-mark)`.
+- ANYTHING THAT MIGHT TAKE MORE THAN A FEW SECONDS (`asdf:load-system`, `asdf:test-system`, `ql:quickload`, a long computation): DO NOT POLL — be *told*, with the sentinel recipe below. The reason is that your shell commands have a per-command timeout (Claude Code's Bash tool caps at 10 minutes), so a `for i in $(seq 1 100); do sleep 6; ...ready-p...; done` watch gets killed mid-watch: you stop watching without noticing, report nothing, and I have to tell you by hand that the REPL went idle. A blocking `while [ ! -e "$SENT" ]` costs almost nothing, so it survives far longer, it is trivially bounded, and it is resumable — the sentinel file persists, so re-running the wait picks it straight back up.
+
+Canonical long-running-work recipe — copy it and change the form:
+
+```sh
+# 1. Target-dependent setup. Pick ONE pair.
+# Native Linux/WSL Emacs — one spelling everywhere:
+EC=emacsclient
+SENT_E=/tmp/claude-repl-done   # path handed to the helper (Emacs's view)
+SENT_S=/tmp/claude-repl-done   # the same file, as your shell sees it
+# Windows Emacs — same file, two spellings:
+# EC=/mnt/c/portable-programs/emacs-30.2/bin/emacsclient.exe
+# SENT_E='C:/Users/you/tmp/claude-repl-done'
+# SENT_S=/mnt/c/Users/you/tmp/claude-repl-done
+
+# 2. Mark, then send with BOTH the error capture and the sentinel.
+"$EC" --eval "(my/slime-mark)"
+"$EC" --eval "(my/slime-send-capturing-then-touch \
+\"$SENT_E\" \"(asdf:test-system :my-system)\")"
+
+# 3. Wait: blocking, and BOUNDED well under your command timeout.
+END=$((SECONDS + 300))
+while [ ! -e "$SENT_S" ] && [ "$SECONDS" -lt "$END" ]; do sleep 2; done
+[ -e "$SENT_S" ] && cat "$SENT_S" || echo STILL-RUNNING
+
+# 4. Read the output back through a file (no --eval size/escaping limit).
+"$EC" --eval "(my/slime-output-since-mark-to-file \"$SENT_E.out\")"
+cat "$SENT_S.out"
+```
+
+Step 3 prints either `STILL-RUNNING` or the sentinel's own one-line report, e.g. `(:done t :elapsed-ms 512340 :prompt-returns 1 :output-chars 18422 :suspect nil)`. Read it before you trust a *fast* return: `:prompt-returns 1` with output means the form really did finish (a warm fasl cache makes a `quickload` return in milliseconds — that is normal, not a glitch), whereas `:suspect t` means the prompt was redrawn more than once while the sentinel was armed, so the fire may not be your form finishing. That one `cat` is there to save you a round trip re-checking `my/slime-repl-status` — and to stop you distrusting a result that was real.
+
+If step 3 prints STILL-RUNNING, the form is simply still going: say so, run the same wait block again, and if you want evidence it is alive check that `(my/slime-repl-status)`'s `:tail` is moving. Never conclude "nothing happened" just because your own wait ended.
+
+Use `my/slime-send-capturing-then-touch`, not the bare `my/slime-send-then-touch`: the sentinel rides the prompt-return edge, so a form that errors into SLDB never touches it and your wait would block until someone aborts the debugger. Capturing the error keeps the prompt coming back, with the condition and a backtrace in the output you read at step 4.
+
+When you do poll, poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
+
+Restarting the Lisp image is yours to do — do not ask my permission, just tell me you are doing it and what you re-loaded. It is cheap and fully recoverable; the only cost is the re-load and whatever in-image state we had built up. Restart whenever a stale image would lie to us: `defstruct` / `defclass` slot changes (old accessors and instances linger), a renamed or deleted function whose old ftype or export proclamations are still in the package, changed package definitions, or when we want to verify a genuinely cold load. Use `(my/slime-restart-and-wait 60 "(asdf:load-system :my-system)" "SENT_E")` — it restarts, waits for the new connection, marks, and sends the re-load with capture + sentinel, so you then block on the sentinel exactly as in step 3 above. Check `(my/slime-ready-p)` first so you are not killing a form I launched. If Emacs did not start the image itself (`M-x slime-connect`; `(my/slime-repl-status)` reports `:can-restart nil`), the helper says so — then ask me.
 
 In our future interactions, "stage" instructions would mean send instructions to the REPL without executing them (no 'Enter').
 
@@ -102,11 +147,13 @@ Then:
 | stage without evaluating | `(my/slime-stage "FORM")` |
 | submit | `(my/slime-send "FORM")` |
 | stage/submit a form too big or too quoted to pass through `--eval` | `(my/slime-stage-file "/tmp/in.lisp")`, `(my/slime-send-file "/tmp/in.lisp")` |
-| submit and read the result | `(my/slime-send-wait "FORM" TIMEOUT)` |
+| submit and read the result (quick forms only) | `(my/slime-send-wait "FORM" TIMEOUT)` |
 | submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
-| slow work (system load, test run) | `(my/slime-mark)`, `(my/slime-send ...)`, poll `(my/slime-ready-p)` from the shell, then `(my/slime-output-since-mark)` |
-| be *told* when idle instead of polling (sentinel file for the shell to wait on) | `(my/slime-send-then-touch "/tmp/done" "FORM")`, then `while [ ! -e /tmp/done ]; do sleep 0.2; done` |
+| **slow work (system load, test run) — the default shape** | `(my/slime-mark)`, `(my/slime-send-capturing-then-touch "/tmp/done" "FORM")`, block on `/tmp/done` from the shell, `cat` it to see how it fired, then `(my/slime-output-since-mark-to-file "/tmp/done.out")` — the recipe above |
+| short form: send and check | `(my/slime-mark)`, `(my/slime-send "FORM")`, a few `(my/slime-ready-p)` polls, `(my/slime-output-since-mark)` |
+| sentinel *without* the error capture (rarely what you want) | `(my/slime-send-then-touch "/tmp/done" "FORM")` |
+| restart the image, wait for the new REPL, re-load | `(my/slime-restart-and-wait 60 "(asdf:load-system :sys)" "/tmp/done")` |
 | submit + wait, output to a file (dodges the reply-size/escaping limit) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output to a file rather than through `--eval` | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
 | stop a runaway form | `(my/slime-interrupt)` |
@@ -116,11 +163,11 @@ Then:
 
 (On a Windows Emacs, the `/tmp/...` file paths above must follow the path rules: a Windows path for the helper, its `/mnt/c/...` spelling for the shell.)
 
-Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`, which queues the user's keystrokes and makes Emacs feel frozen until the form finishes. Poll from the shell instead, so the sleeping happens outside Emacs.
+Do not use `my/slime-send-wait` for slow work: it blocks Emacs in `sleep-for`, which queues the user's keystrokes and makes Emacs feel frozen until the form finishes. Wait from the shell instead, so the sleeping happens outside Emacs — on the sentinel for slow work, on `my/slime-ready-p` for a form you expect back in a second or two.
 
 Expect slow to look like stuck. Touching a file near the root of a `:serial t` ASDF system makes every downstream file recompile, so a `test-system` can sit silent for many minutes and be perfectly healthy. Judge by whether `(my/slime-repl-status)`'s `:tail` is *moving*, not by elapsed time — and if it really is wedged, `(my/slime-interrupt)` ends it without touching the user's window.
 
-In day-to-day use, sending and reading back go together: `my/slime-stage` / `my/slime-send` put the form in the REPL where the user can see it, and the reading helpers are how you then find out what it did. The usual shape for anything non-trivial is `my/slime-mark` → `my/slime-send` → poll `my/slime-ready-p` from the shell → `my/slime-output-since-mark`. Staging is the one case with nothing to read back: a staged form has not run yet, so report "staged" and leave the prompt alone.
+In day-to-day use, sending and reading back go together: `my/slime-stage` / `my/slime-send` put the form in the REPL where the user can see it, and the reading helpers are how you then find out what it did. Two shapes, and picking the wrong one is the classic mistake: for a quick form, `my/slime-mark` → `my/slime-send` → a few `my/slime-ready-p` polls → `my/slime-output-since-mark`; for anything slow, `my/slime-mark` → `my/slime-send-capturing-then-touch` → block on the sentinel → `my/slime-output-since-mark-to-file`. Staging is the one case with nothing to read back: a staged form has not run yet, so report "staged" and leave the prompt alone.
 
 If you find better variants, tell me so I can improve this prompt.
 ````
@@ -298,13 +345,13 @@ would rather keep the prompt self-contained.
 (my/slime-repl-status)                ; target, connected? busy? visible? pending input?
 ```
 
-For anything slow — `(ql:quickload ...)`, a test suite — use the non-blocking
-sequence instead, which keeps Emacs responsive because every call returns at
-once and the shell does the waiting:
+For a form you expect back in a second or two, the non-blocking mark / send /
+poll / read sequence is enough — every call returns at once, so Emacs stays
+responsive and the shell does the (short) waiting:
 
 ```elisp
 (my/slime-mark)                       ; remember where output starts
-(my/slime-send "(ql:quickload :my-system)")
+(my/slime-send "(foo 1)")
 (my/slime-ready-p)                    ; poll this from the shell, sleeping there
 (my/slime-output-since-mark 2000)     ; collect the result
 
@@ -314,6 +361,12 @@ once and the shell does the waiting:
 (my/slime-send-wait-to-file "/tmp/out.txt" "(asdf:load-system :sys :force t)" 300)
 (my/slime-interrupt)                  ; stop a runaway form you started
 ```
+
+For anything genuinely slow — `(ql:quickload …)`, `asdf:load-system`, a test
+suite — **do not poll at all**: send it with a done-sentinel and let the shell
+block on that file. See [Long-running work: be told, don't
+poll](#long-running-work-be-told-dont-poll) for the canonical recipe and the
+reason polling breaks in an agent harness.
 
 > **`*ERROR*: Unknown message:` — it is about reply *size*, not noisy builds.**
 > `emacsclient --eval` prints the result as an Elisp string literal, and past a
@@ -345,39 +398,40 @@ once and the shell does the waiting:
 > `/tmp/out.txt` will **not** round-trip there — Windows Emacs writes it under
 > `C:\tmp` while the shell reads WSL `/tmp`.
 
-Instead of *polling* `my/slime-busy-p` at all, you can be *told* when the REPL
-falls idle. SLIME ships no such hook — `my/slime-repl-idle-functions` adds one,
-run each time the prompt returns *and* the Lisp is idle (so with several forms
-pipelined it fires only when the last one drains, not between them):
+### The idle signal the sentinel is built on
+
+Being *told* the REPL is free — rather than asking it repeatedly — needs a hook
+SLIME does not ship. `my/slime-repl-idle-functions` adds one, run each time the
+prompt returns *and* the Lisp is idle (so with several forms pipelined it fires
+only when the last one drains, not between them):
 
 ```elisp
 ;; Emacs-side: react to idle however you like
 (add-hook 'my/slime-repl-idle-functions (lambda () (message "REPL free")))
 (my/slime-run-once-when-idle (lambda () …))    ; fire exactly once, next idle
-
-;; Shell-side: send, then have the prompt-return create a sentinel FILE, so the
-;; shell can BLOCK on the file appearing instead of re-polling my/slime-busy-p:
-(my/slime-send-then-touch "/tmp/done" "(asdf:load-system :sys :force t)")
 ```
 
-```sh
-emacsclient --eval '(my/slime-send-then-touch "/tmp/done" "(long-form)")'
-while [ ! -e /tmp/done ]; do sleep 0.2; done      # woken by the prompt returning
-```
-
-(The same Windows path caveat as above applies to the `/tmp/done` sentinel.)
+`my/slime-send-then-touch` is that one-shot turned into a file, which is what a
+shell driver can actually wait on — see [Long-running work: be told, don't
+poll](#long-running-work-be-told-dont-poll) for how to use it. The file carries
+one line of evidence about how it fired (`:elapsed-ms`, `:prompt-returns`,
+`:output-chars`, `:suspect`), because the caveat below — that a package switch
+also redraws the prompt — is otherwise invisible to whoever is waiting, and
+indistinguishable from a real but fast completion.
 
 It rides the prompt-return edge, so it does **not** fire while a form is parked
 in SLDB — a *stricter* and more trustworthy test than `my/slime-busy-p`, which
 already reads `nil` for a debugged form. The flip side is that a form that errors
-into SLDB will never touch the sentinel file, so a shell `while [ ! -e /tmp/done ]`
-loop blocks until you abort the debugger; give it a timeout, or pair it with
-`my/slime-send-capturing` so errors never reach SLDB in the first place. The
-one-shot is armed *before* the form is sent so a fast form cannot finish first.
-One caveat: a
-package switch also redraws the prompt, so keep idle functions cheap and
-idempotent. This is a REPL-input signal — for arbitrary background RPCs
-(`slime-eval-async`) you would hook `slime-event-hooks` instead.
+into SLDB never touches the sentinel file, so a shell `while [ ! -e /tmp/done ]`
+loop blocks until you abort the debugger — which is why the recipe uses
+`my/slime-send-capturing-then-touch` (errors never reach SLDB, so the prompt
+always comes back) *and* bounds the wait. The one-shot is armed *before* the
+form is sent so a fast form cannot finish first, and any pre-existing sentinel
+file is deleted first so a leftover from an earlier call cannot make the next
+wait return instantly. One caveat: a package switch also redraws the prompt, so
+keep idle functions cheap and idempotent. This is a REPL-input signal — for
+arbitrary background RPCs (`slime-eval-async`) you would hook
+`slime-event-hooks` instead.
 
 To keep an error *in* the REPL — printing its condition and a backtrace, and
 returning `:error` — instead of blocking on an SLDB debugger buffer:
@@ -437,6 +491,131 @@ Six things worth knowing about this file, each learned the hard way:
 - **The REPL is never forced into the user's window.** It is surfaced only when
   it is not already visible in some window on some frame (`0` = all frames,
   including iconified ones).
+
+## Long-running work: be told, don't poll
+
+Loading a system, running a test suite, `ql:quickload` — anything that might run
+longer than a few seconds gets **one** shape, and it is not a poll loop:
+
+```sh
+# 1. Target-dependent setup. Pick ONE pair.
+# Native Linux/WSL Emacs — one spelling everywhere:
+EC=emacsclient
+SENT_E=/tmp/claude-repl-done   # path handed to the helper (Emacs's view)
+SENT_S=/tmp/claude-repl-done   # the same file, as the shell sees it
+# Windows Emacs — same file, two spellings:
+# EC=/mnt/c/portable-programs/emacs-30.2/bin/emacsclient.exe
+# SENT_E='C:/Users/you/tmp/claude-repl-done'
+# SENT_S=/mnt/c/Users/you/tmp/claude-repl-done
+
+# 2. Mark, then send with BOTH the error capture and the sentinel.
+"$EC" --eval "(my/slime-mark)"
+"$EC" --eval "(my/slime-send-capturing-then-touch \
+\"$SENT_E\" \"(asdf:test-system :my-system)\")"
+
+# 3. Wait: blocking, and BOUNDED well under the command timeout.
+END=$((SECONDS + 300))
+while [ ! -e "$SENT_S" ] && [ "$SECONDS" -lt "$END" ]; do sleep 2; done
+[ -e "$SENT_S" ] && cat "$SENT_S" || echo STILL-RUNNING
+
+# 4. Read the output back through a file (no --eval size/escaping limit).
+"$EC" --eval "(my/slime-output-since-mark-to-file \"$SENT_E.out\")"
+cat "$SENT_S.out"
+```
+
+Five things are deliberately in one place there, because each of them is a way
+the workflow goes wrong on its own:
+
+- **Sentinel, not polling.** An agent harness caps how long a single command may
+  run — Claude Code's Bash tool at 10 minutes — so a
+  `for i in $(seq 1 100); do sleep 6; …ready-p…; done` watch on a `test-system`
+  is *killed mid-watch*. The driver does not notice that it stopped watching: it
+  reports nothing, and the user ends up saying "the REPL is idle" by hand. A
+  blocking `while [ ! -e … ]` hits the same ceiling in principle, but it costs
+  almost nothing per second, so it survives far longer, and it is trivial to
+  bound.
+- **A bounded wait that says which way it ended.** Step 3 always prints either
+  `STILL-RUNNING` or the sentinel's report, so "my wait ended" is never mistaken
+  for "the work finished". `STILL-RUNNING` is not a failure: the wait is
+  *resumable* — the sentinel file persists — so re-running the same block picks
+  the wait straight back up. Confirm it is alive by checking that
+  `(my/slime-repl-status)`'s `:tail` is moving, not by how long it has been.
+- **A sentinel that is not silent about how it fired.** The file is not empty;
+  it holds one readable line —
+  `(:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)`.
+  Elapsed time alone cannot tell a genuinely fast completion from a spurious
+  fire (a warm fasl cache returns a `quickload` in milliseconds, and the prompt
+  is also redrawn by `slime-repl-set-package`), so the driver would either burn
+  a round trip on `my/slime-repl-status` or distrust a real result.
+  `:prompt-returns` is 1 for a clean single completion and `:suspect` flags
+  anything above that; `:output-chars` counts what the REPL gained since the
+  form was submitted. Written atomically — temp file plus rename — so a wait
+  that sees the file appear never reads a half-written line.
+- **The path pair.** On a Windows Emacs the sentinel is written by the *Windows*
+  process, so the helper needs `C:/…` and the shell needs the `/mnt/c/…`
+  spelling of the same file. Naming the two spellings once, at the top, is what
+  stops a `while [ ! -e /tmp/done ]` from waiting forever on a file Emacs
+  created under `C:\tmp`.
+- **Capture, so an error cannot strand the wait.** The sentinel rides the
+  prompt-return edge, and a form parked in SLDB never returns the prompt — so
+  the bare `my/slime-send-then-touch` blocks until a human aborts the debugger.
+  `my/slime-send-capturing-then-touch` keeps the error in the REPL (condition,
+  backtrace, return value `:error`), so the prompt always comes back and step 4
+  shows what happened.
+
+`my/slime-send-wait` is the wrong tool here in a different way: it does the
+waiting *inside* Emacs (`sleep-for`), queueing the user's keystrokes and making
+their editor feel frozen for the whole build.
+
+## Restarting the image
+
+**Claude may restart the Lisp image on its own — it should not ask.** The cost
+is one re-load plus whatever in-image state had accumulated, and nothing is
+unrecoverable, so stalling for permission wastes a round-trip on a decision that
+has one sensible answer. Announcing it afterwards ("restarted, re-loaded
+`cl-abc`") is enough; the user is watching the REPL and will see the fresh
+banner anyway.
+
+Restart when a stale image would give a wrong answer:
+
+- **`defstruct` / `defclass` slot changes** — old accessors, old instances, and
+  a redefinition warning instead of the behaviour you are testing.
+- **A renamed or deleted function** — its `ftype` proclamation and its export
+  are still in the package, so the image resolves a symbol that no longer exists
+  in the source.
+- **Package definition changes** — `defpackage` edits do not retroactively
+  unintern anything.
+- **Verifying a genuinely cold load** — a system that only builds because an
+  earlier session defined a symbol will pass in the live image and fail for
+  everyone else.
+
+```elisp
+(my/slime-restart-and-wait)                       ; just restart and reconnect
+(my/slime-restart-and-wait 60
+                           "(asdf:load-system :my-system)"
+                           "/tmp/claude-repl-done")
+```
+
+It restarts the inferior Lisp, blocks until a **new** connection is ready
+(different connection object *and* `my/slime-ready-p`, so a lingering old
+connection cannot be mistaken for the restarted image), then — if given a load
+form — calls `my/slime-mark` and sends the load with capture + sentinel. The
+load itself is *not* waited for; you block on the sentinel from the shell
+exactly as in step 3 of the recipe above. Blocking Emacs is acceptable for the
+reconnect only because it takes a couple of seconds. It returns a plist:
+
+```elisp
+(:restarted t :connected t :elapsed 2.3 :repl-buffer "*slime-repl sbcl*"
+ :load-sent "(asdf:load-system :my-system)" :sentinel "/tmp/claude-repl-done")
+```
+
+Two caveats. First, the restart kills whatever the image was doing, including a
+form the *user* launched — check `(my/slime-ready-p)` first. Second, Emacs can
+only restart an image it started itself: with `M-x slime-connect` (Annex B, SBCL
+under tmux) there is no inferior process, `my/slime-repl-status` reports
+`:can-restart nil`, and the helper signals a clear error instead of pretending.
+There, restart the image where it actually runs — for Annex B, that is
+`tmux send-keys` into the `lisp` session — or ask the user.
 
 ## Compilation policy and catching errors
 
@@ -534,7 +713,9 @@ under test.
 > form completed; and `my/slime-send-then-touch` *does* block indefinitely on an
 > SLDB park, because it rides the prompt-return edge, which a debugged form never
 > reaches until you abort. That sentinel file is the one place where "waits
-> forever" is the true failure mode.
+> forever" is the true failure mode — which is why the long-running recipe sends
+> with `my/slime-send-capturing-then-touch` (no SLDB park, so the prompt always
+> returns) *and* bounds the shell wait.
 
 ### Interrupt a hang, then read the backtrace
 
@@ -788,7 +969,36 @@ The user may be interacting with the lisp image through the Emacs REPL on its ow
 
 If you need to send several instructions to the REPL, send them one at a time, waiting for the prompt to return between them.
 
-Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result. Mark before you send (`(my/slime-mark)`), poll `(my/slime-ready-p)` from the shell until the form has finished, then read the output (`(my/slime-output-since-mark)`) and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter. Poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
+Send and read back: when I ask you to stage something, stage it and just tell me "staged"; when I ask you to execute something, send it and then have a look at the result and tell me what it returned and what you make of it. Do not just say "sent" and stop. I am watching the REPL too, so keep the report short when it worked; spend the words when something failed. After staging, leave the prompt alone: checking whether the *staged* form is still pending just races my RET — the read-back rule applies to forms you sent, not to forms waiting for me to press Enter.
+
+For a SHORT form: mark before you send (`(my/slime-mark)`), poll `(my/slime-ready-p)` from the shell until it says `t`, then read the output (`(my/slime-output-since-mark)`).
+
+For ANYTHING THAT MIGHT TAKE MORE THAN A FEW SECONDS (`asdf:load-system`, `asdf:test-system`, `ql:quickload`, a long computation): DO NOT POLL. Send it with a done-sentinel and BLOCK on that file:
+
+```sh
+EC=/mnt/c/portable-programs/emacs-30.2/bin/emacsclient.exe
+SENT_E='C:/Users/you/tmp/claude-repl-done'   # as the Windows Emacs writes it
+SENT_S=/mnt/c/Users/you/tmp/claude-repl-done # the same file, from your shell
+
+"$EC" --eval "(my/slime-mark)"
+"$EC" --eval "(my/slime-send-capturing-then-touch \
+\"$SENT_E\" \"(asdf:test-system :my-system)\")"
+
+END=$((SECONDS + 300))
+while [ ! -e "$SENT_S" ] && [ "$SECONDS" -lt "$END" ]; do sleep 2; done
+[ -e "$SENT_S" ] && cat "$SENT_S" || echo STILL-RUNNING
+
+"$EC" --eval "(my/slime-output-since-mark-to-file \"$SENT_E.out\")"
+cat "$SENT_S.out"
+```
+
+Your shell commands have a per-command timeout (Claude Code's Bash tool caps at 10 minutes), so a `for i in $(seq 1 100); do sleep 6; ...ready-p...; done` watch gets killed mid-watch: you stop watching without noticing and report nothing. The blocking wait above is far cheaper, bounded, and resumable — on STILL-RUNNING, say so and run the same wait block again rather than concluding nothing happened. Use `my/slime-send-capturing-then-touch` rather than the bare `my/slime-send-then-touch`, because a form that errors into SLDB never returns the prompt and so never touches the sentinel.
+
+The sentinel is not empty: it holds one line, e.g. `(:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)`. Read it before distrusting a *fast* return — `:prompt-returns 1` plus output means the form genuinely finished (a warm fasl cache is fast, and that is fine); `:suspect t` means the prompt was redrawn more than once while the sentinel was armed, so check `(my/slime-repl-status)` before believing it.
+
+When you do poll, poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
+
+Note that here Emacs did NOT start the image — it connected to the one running in tmux — so `my/slime-restart-and-wait` cannot help and `(my/slime-repl-status)` reports `:can-restart nil`. When a restart is warranted (changed `defstruct` slots, stale ftype/export proclamations after a rename, checking a cold load), restart the tmux image yourself with `tmux send-keys` and re-establish swank, telling me what you are doing — or ask me if I might be mid-something.
 
 Paths sent to the image must be in WSL form (`/mnt/c/...`), since the SBCL image runs in Linux. Paths sent to Emacs itself (`load-file` etc.) must be in Windows form (`C:/...`).
 
@@ -806,7 +1016,7 @@ The staging/sending/reading helpers are in [`slime-bridge.el`](slime-bridge.el).
 emacsclient --eval '(load-file "/path/to/claude-lisp-repl/slime-bridge.el")'
 ```
 
-The helper calls are the same as the main recipe (see its "Helper functions" section for the full table and cautions): `my/slime-stage` / `my/slime-send` to stage and submit; `my/slime-send-wait` to read a result back; `my/slime-send-capturing` / `my/slime-send-timed` to keep an error or a hang in the REPL instead of SLDB; the `my/slime-mark` → poll `my/slime-ready-p` → `my/slime-output-since-mark` sequence for slow work; `my/slime-interrupt` / `my/slime-sldb-backtrace` / `my/slime-sldb-abort` after a hang; and `my/slime-repl-status` to see where you are. Same cautions too: do not use `my/slime-send-wait` for slow work (it freezes Emacs in `sleep-for` — poll from the shell instead); poll `my/slime-ready-p` rather than `my/slime-busy-p`, since the latter reads `nil` for a form parked in SLDB and would report an errored form as a finished one; and expect a big `:serial t` recompile to sit silent for minutes yet be healthy (judge by whether `:tail` is moving, not elapsed time).
+The helper calls are the same as the main recipe (see its "Helper functions" section for the full table and cautions): `my/slime-stage` / `my/slime-send` to stage and submit; `my/slime-send-wait` to read a quick result back; `my/slime-send-capturing` / `my/slime-send-timed` to keep an error or a hang in the REPL instead of SLDB; the `my/slime-mark` → poll `my/slime-ready-p` → `my/slime-output-since-mark` sequence for short forms, and `my/slime-send-capturing-then-touch` + a blocking sentinel wait for slow ones; `my/slime-interrupt` / `my/slime-sldb-backtrace` / `my/slime-sldb-abort` after a hang; and `my/slime-repl-status` to see where you are. Same cautions too: do not use `my/slime-send-wait` for slow work (it freezes Emacs in `sleep-for` — wait from the shell instead); poll `my/slime-ready-p` rather than `my/slime-busy-p`, since the latter reads `nil` for a form parked in SLDB and would report an errored form as a finished one; and expect a big `:serial t` recompile to sit silent for minutes yet be healthy (judge by whether `:tail` is moving, not elapsed time).
 
 If you find better variants, tell me so I can improve this prompt.
 ````
