@@ -39,7 +39,9 @@
 ;;     minutes), so the loop is killed mid-watch and the driver never learns
 ;;     the form finished.  A `while [ ! -e SENTINEL ]' wait is far cheaper,
 ;;     survives much longer, is trivially bounded, and is RESUMABLE -- the
-;;     sentinel persists, so re-running the wait picks it back up.
+;;     sentinel persists, so re-running the wait picks it back up.  Read the
+;;     line it holds and test `:done': the wait also ends when the form parks
+;;     in the debugger, and that case says `(:done nil :sldb t ...)'.
 ;;
 ;; Staging is the exception to reading back: a staged form has not run, so
 ;; report "staged" and leave the prompt alone rather than polling it (that
@@ -153,17 +155,59 @@ The forms run as visible REPL input and land in the SLIME history."
 ;;; unwinds, so the backtrace is taken at the signalling point and actually
 ;;; shows where the error came from; the enclosing `block'/`return-from' then
 ;;; performs the unwind cleanly.  SBCL-specific (`sb-debug:print-backtrace').
+;;;
+;;; The guard must cover READING as well as evaluating.  Splicing CODE straight
+;;; into the wrapper only protects it from evaluation-time errors: the handler
+;;; is part of the very form being read, so it is not established yet while the
+;;; reader is parsing.  A form naming a package that does not exist in the image
+;;; yet (`my-system::+some-constant+' before the system is loaded) signals
+;;; SB-INT:SIMPLE-READER-PACKAGE-ERROR during READ, and unbalanced parens signal
+;;; END-OF-FILE -- both straight into SLDB, past a guard that had no chance to
+;;; run.  So CODE travels as a STRING and the wrapper reads it itself, inside
+;;; the `handler-bind'.  See `my/slime--read-eval-body'.
 ;;; ---------------------------------------------------------------------------
+
+(defun my/slime--lisp-string (s)
+  "Return S as a Lisp string literal: quoted, with \\ and \" escaped.
+Newlines are left as themselves -- a Lisp string may span lines -- so a
+multi-line form stays multi-line and readable in the REPL scrollback."
+  (concat "\"" (replace-regexp-in-string "[\\\"]" "\\\\\\&" s) "\""))
+
+(defun my/slime--read-eval-body (code)
+  "Return a Lisp form that READS CODE from a string and evaluates it.
+Used as the body of the guards in `my/slime--capture-wrap' and
+`my/slime-send-timed', so that reader errors -- a missing package, a stray
+paren -- are signalled INSIDE the guard and self-report like any other error,
+instead of parking the evaluation in SLDB where the guard never ran.
+
+Reads one form at a time and evaluates it before reading the next, exactly as
+the REPL listener does, so a leading `in-package' (or a reader macro CODE itself
+defines) still affects how the following forms are read.  The last form's values
+are returned, all of them, so a multiple-valued form still prints as it would at
+the prompt.  CODE is evaluated by `eval' in the null lexical environment, which
+is what the toplevel prompt does anyway; the wrapper's own bindings are
+therefore invisible to it and cannot be captured."
+  (concat "(with-input-from-string (my/s " (my/slime--lisp-string code) ")\n"
+          "      (let ((my/eof '#:eof) (my/v nil))\n"
+          "        (loop (let ((my/f (read my/s nil my/eof)))\n"
+          "                (when (eq my/f my/eof) (return (values-list my/v)))\n"
+          "                (setf my/v (multiple-value-list (eval my/f)))))))"))
 
 (defun my/slime--capture-wrap (code &optional n-frames)
   "Return CODE as a form that self-reports an ERROR instead of opening SLDB.
 On error the wrapped form prints \"; CONDITION <type>: <message>\" followed by up
 to N-FRAMES backtrace frames (default 20) and returns `:error'; on success it
-returns CODE's own value unchanged.  Split out from `my/slime-send-capturing' so
-the same wrapper can be combined with the sentinel signal -- see
+returns CODE's own values unchanged.  Split out from `my/slime-send-capturing'
+so the same wrapper can be combined with the sentinel signal -- see
 `my/slime-send-capturing-then-touch', which is the pairing that matters: a form
 that errors into SLDB never returns the prompt, so it would never touch the
-sentinel and the shell would wait forever."
+sentinel on that edge -- only the SLDB net would end the wait, and it ends it
+with the image still parked at a debugger prompt.
+
+CODE is embedded as a string and read by the wrapper
+\(`my/slime--read-eval-body') rather than spliced in as source, so READ-time
+errors are caught too -- see the commentary above.  The cost is cosmetic: the
+REPL shows the form inside a string literal, with embedded quotes backslashed."
   (format
    (concat "(block my/slime--capture\n"
            "  (handler-bind\n"
@@ -173,16 +217,18 @@ sentinel and the shell would wait forever."
            "                  (sb-debug:print-backtrace :count %d :stream *standard-output*))\n"
            "                (return-from my/slime--capture (values :error c)))))\n"
            "    %s))")
-   (or n-frames 20) code))
+   (or n-frames 20) (my/slime--read-eval-body code)))
 
 (defun my/slime-send-capturing (code &optional n-frames force)
   "Send CODE wrapped so any ERROR self-reports in the REPL instead of opening SLDB.
 On error the REPL prints \"; CONDITION <type>: <message>\" followed by up to
 N-FRAMES backtrace frames (default 20) and the form returns `:error'; on success
-CODE's own value is returned unchanged.  Like `my/slime-send' this returns
+CODE's own values are returned unchanged.  Like `my/slime-send' this returns
 \"sent\" immediately -- watch the REPL (or use the mark/poll/read helpers) for
-the result.  Note the wrapper only traps `error'; conditions that are not
-`error' subtypes, and a deliberate C-c interrupt, still reach SLDB as usual.
+the result.  READ-time errors are trapped as well as evaluation-time ones -- a
+missing package, a stray paren -- because the wrapper reads CODE itself; see
+`my/slime--capture-wrap'.  What is still NOT trapped: conditions that are not
+`error' subtypes, and a deliberate C-c interrupt, which reach SLDB as usual.
 
 For slow work, prefer `my/slime-send-capturing-then-touch', which adds the
 done-sentinel so the shell can block instead of poll."
@@ -193,7 +239,9 @@ done-sentinel so the shell can block instead of poll."
 If CODE does not finish within SECONDS -- or signals an `error' first -- the REPL
 prints a backtrace taken at the point of the hang/error (via `handler-bind',
 before the stack unwinds) and the form returns `:timed-out' or `:error';
-otherwise CODE's own value is returned.  N-FRAMES defaults to 20.
+otherwise CODE's own values are returned.  N-FRAMES defaults to 20.  Like
+`my/slime-send-capturing' it reads CODE inside the guard, so a reader error
+(missing package, stray paren) self-reports too instead of opening SLDB.
 
 This is the deterministic, safer alternative to `my/slime-interrupt': the timeout
 is delivered by the image's own timer, so there is no external SIGINT and the
@@ -219,7 +267,8 @@ stopping something already running that you did not launch this way.  Returns
             "           (return-from my/slime--timed (values :error c)))))\n"
             "    (sb-ext:with-timeout %s\n"
             "      %s)))")
-    seconds (or n-frames 20) (or n-frames 20) seconds code)
+    seconds (or n-frames 20) (or n-frames 20) seconds
+    (my/slime--read-eval-body code))
    force))
 
 ;;; ---------------------------------------------------------------------------
@@ -607,7 +656,7 @@ itself before calling FN, so a re-entrant FN cannot re-trigger it."
     (add-hook 'my/slime-repl-idle-functions entry)
     entry))
 
-(defun my/slime--write-sentinel (path armed-at armed-prompts start-pos)
+(defun my/slime--write-sentinel (path armed-at armed-prompts start-pos &optional sldb)
   "Write the done-sentinel PATH with evidence about how it came to fire.
 
 ARMED-AT is a `float-time' taken when the one-shot was armed, ARMED-PROMPTS the
@@ -629,6 +678,12 @@ are what separate them.  A 0 ms fire with :output-chars 0 and :suspect t is a
 redraw; a 200 ms fire with thousands of characters of output is a warm cache
 doing exactly what it should.
 
+With SLDB non-nil the line instead starts `(:done nil :sldb t ...)': the form
+did not finish, it parked in the debugger, and the wait was ended by the net in
+`my/slime-send-then-touch' rather than by a prompt return.  `:done' is therefore
+the field to test -- a caller that only checks \"the file exists\" will read a
+parked form as a finished one.
+
 Written atomically, so a shell that sees PATH appear never reads a partial line.
 Never signals: an unreadable REPL buffer degrades to :output-chars -1, because
 failing to write the sentinel would hang the waiting shell -- a far worse
@@ -641,7 +696,8 @@ outcome than a missing number."
                   (error -1))))
     (my/slime--write-atomically
      (format
-      "(:done t :elapsed-ms %d :prompt-returns %d :output-chars %d :suspect %s)\n"
+      "(%s :elapsed-ms %d :prompt-returns %d :output-chars %d :suspect %s)\n"
+      (if sldb ":done nil :sldb t" ":done t")
       elapsed-ms returns chars (if (> returns 1) "t" "nil"))
      path)))
 
@@ -675,10 +731,20 @@ early.  Without it a 0-second return on a `ql:quickload' is indistinguishable
 from a spurious one, and the honest driver wastes a round trip re-checking
 `my/slime-repl-status' -- or, worse, distrusts a real result.
 
-CAUTION: it rides the prompt-return edge, so a form that errors into SLDB never
-touches PATH and the wait blocks until you abort the debugger.  Bound the shell
-wait, and prefer `my/slime-send-capturing-then-touch', which removes the failure
-mode instead of merely bounding it."
+The prompt-return edge is not the only way the wait can end: a second one-shot
+is armed on `sldb-hook', so a form that parks in the debugger writes PATH too,
+as `(:done nil :sldb t ...)'.  Whichever fires first disarms the other, so the
+verdict is the FIRST thing that happened and a later abort cannot overwrite it.
+That net is what makes \"the wait always ends\" true unconditionally -- the error
+capture in `my/slime-send-capturing-then-touch' handles `error' conditions, but
+an interrupt or a non-`error' `serious-condition' still opens SLDB.  Test
+`:done', not the mere existence of PATH, or a parked form reads as a finished
+one.  (`sldb-hook' is global, so an unrelated debugger entry while CODE runs
+would also end the wait -- it says `:sldb t', which is honest either way.)
+
+Prefer `my/slime-send-capturing-then-touch': ending the wait with `:sldb t'
+still leaves the image parked in the debugger, whereas capturing keeps the form
+running to a real prompt."
   (when (file-exists-p path)
     (delete-file path))
   (let* ((armed-at (float-time))
@@ -686,21 +752,33 @@ mode instead of merely bounding it."
          ;; Reset to the post-send position below, so the echoed input form
          ;; itself is not counted as output.
          (start-pos (with-current-buffer (my/slime-assert-connected) (point-max)))
-         (entry (my/slime-run-once-when-idle
-                 (lambda ()
-                   (my/slime--write-sentinel path armed-at armed-prompts
-                                             start-pos)))))
-    (condition-case err
-        (progn
-          (my/slime-send code force)
-          ;; No process output can arrive between the send and this setq --
-          ;; nothing here yields to the filter -- so the one-shot cannot fire
-          ;; with the stale position.
-          (setq start-pos
-                (with-current-buffer (slime-output-buffer) (point-max))))
-      (error
-       (remove-hook 'my/slime-repl-idle-functions entry)
-       (signal (car err) (cdr err)))))
+         idle-entry sldb-entry)
+    (letrec ((disarm (lambda ()
+                       (remove-hook 'my/slime-repl-idle-functions idle-entry)
+                       (remove-hook 'sldb-hook sldb-entry)))
+             (fire (lambda (sldb)
+                     (funcall disarm)
+                     (my/slime--write-sentinel path armed-at armed-prompts
+                                               start-pos sldb))))
+      (setq idle-entry (lambda () (funcall fire nil))
+            ;; Runs inside `sldb-setup', with the SLDB buffer current; demote
+            ;; errors so a failure here cannot break the debugger buffer.
+            sldb-entry (lambda ()
+                         (with-demoted-errors "my/slime sldb sentinel error: %S"
+                           (funcall fire t))))
+      (add-hook 'my/slime-repl-idle-functions idle-entry)
+      (add-hook 'sldb-hook sldb-entry)
+      (condition-case err
+          (progn
+            (my/slime-send code force)
+            ;; No process output can arrive between the send and this setq --
+            ;; nothing here yields to the filter -- so the one-shot cannot fire
+            ;; with the stale position.
+            (setq start-pos
+                  (with-current-buffer (slime-output-buffer) (point-max))))
+        (error
+         (funcall disarm)
+         (signal (car err) (cdr err))))))
   "sent")
 
 (defun my/slime-send-capturing-then-touch (path code &optional n-frames force)
@@ -719,7 +797,15 @@ SLDB never returns the prompt, so PATH is never created and a shell
 error means the prompt always comes back -- with `:error' and a backtrace in the
 output -- so the wait always ends.  Returns \"sent\" immediately.  Mark first
 \(`my/slime-mark') and read `my/slime-output-since-mark-to-file' once PATH
-appears."
+appears.
+
+The capture covers READING as well as evaluating (`my/slime--capture-wrap'), so
+a form naming a package the image does not have yet -- the classic
+`(my-system::+some-constant+)' before the system is loaded -- self-reports
+instead of parking in SLDB.  What capture cannot cover is a non-`error'
+`serious-condition' or a C-c interrupt; for those the SLDB net in
+`my/slime-send-then-touch' ends the wait with `(:done nil :sldb t ...)'.  So
+test `:done' in the sentinel rather than treating its existence as success."
   (my/slime-send-then-touch path (my/slime--capture-wrap code n-frames) force))
 
 ;;; ---------------------------------------------------------------------------

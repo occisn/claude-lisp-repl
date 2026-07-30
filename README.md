@@ -115,7 +115,9 @@ Step 3 prints either `STILL-RUNNING` or the sentinel's own one-line report, e.g.
 
 If step 3 prints STILL-RUNNING, the form is simply still going: say so, run the same wait block again, and if you want evidence it is alive check that `(my/slime-repl-status)`'s `:tail` is moving. Never conclude "nothing happened" just because your own wait ended.
 
-Use `my/slime-send-capturing-then-touch`, not the bare `my/slime-send-then-touch`: the sentinel rides the prompt-return edge, so a form that errors into SLDB never touches it and your wait would block until someone aborts the debugger. Capturing the error keeps the prompt coming back, with the condition and a backtrace in the output you read at step 4.
+Use `my/slime-send-capturing-then-touch`, not the bare `my/slime-send-then-touch`: the sentinel rides the prompt-return edge, so a form that errors into SLDB never touches it and your wait would block until someone aborts the debugger. Capturing the error keeps the prompt coming back, with the condition and a backtrace in the output you read at step 4. The capture covers *read*-time errors too — a form naming a package the image does not have yet (`(my-system::+some-constant+)` before the system is loaded) — because the wrapper reads the form itself, inside the guard.
+
+Test `:done` in the sentinel rather than treating the file's existence as success. A form that reaches SLDB anyway — a C-c interrupt, or a condition that is not an `error` — is caught by a second one-shot on `sldb-hook`, which writes `(:done nil :sldb t …)`. That ends your wait instead of hanging it, but the image is *parked in the debugger*: read `(my/slime-sldb-backtrace-to-file "/tmp/sldb.txt")`, then `(my/slime-sldb-abort)`.
 
 When you do poll, poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
 
@@ -148,7 +150,7 @@ Then:
 | submit | `(my/slime-send "FORM")` |
 | stage/submit a form too big or too quoted to pass through `--eval` | `(my/slime-stage-file "/tmp/in.lisp")`, `(my/slime-send-file "/tmp/in.lisp")` |
 | submit and read the result (quick forms only) | `(my/slime-send-wait "FORM" TIMEOUT)` |
-| submit, catching errors in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
+| submit, catching errors (read-time ones included) in the REPL instead of SLDB | `(my/slime-send-capturing "FORM")` |
 | bound a hang deterministically (safer than interrupt) | `(my/slime-send-timed "FORM" SECONDS)` |
 | **slow work (system load, test run) — the default shape** | `(my/slime-mark)`, `(my/slime-send-capturing-then-touch "/tmp/done" "FORM")`, block on `/tmp/done` from the shell, `cat` it to see how it fired, then `(my/slime-output-since-mark-to-file "/tmp/done.out")` — the recipe above |
 | short form: send and check | `(my/slime-mark)`, `(my/slime-send "FORM")`, a few `(my/slime-ready-p)` polls, `(my/slime-output-since-mark)` |
@@ -422,10 +424,15 @@ indistinguishable from a real but fast completion.
 It rides the prompt-return edge, so it does **not** fire while a form is parked
 in SLDB — a *stricter* and more trustworthy test than `my/slime-busy-p`, which
 already reads `nil` for a debugged form. The flip side is that a form that errors
-into SLDB never touches the sentinel file, so a shell `while [ ! -e /tmp/done ]`
-loop blocks until you abort the debugger — which is why the recipe uses
-`my/slime-send-capturing-then-touch` (errors never reach SLDB, so the prompt
-always comes back) *and* bounds the wait. The one-shot is armed *before* the
+into SLDB never *returns the prompt*, so on its own that edge would leave a shell
+`while [ ! -e /tmp/done ]` loop blocking until you abort the debugger — which is
+why the recipe uses `my/slime-send-capturing-then-touch` (errors never reach
+SLDB, so the prompt always comes back). Belt and braces: `my/slime-send-then-
+touch` arms a *second* one-shot on `sldb-hook`, so a form that parks in the
+debugger anyway still ends the wait, writing `(:done nil :sldb t …)` instead.
+Whichever one-shot fires first disarms the other, so a later abort cannot
+overwrite the verdict — and `:done` is the field to test, since the file's mere
+existence no longer means the form finished. The one-shot is armed *before* the
 form is sent so a fast form cannot finish first, and any pre-existing sentinel
 file is deleted first so a leftover from an earlier call cannot make the next
 wait return instantly. One caveat: a package switch also redraws the prompt, so
@@ -558,10 +565,20 @@ the workflow goes wrong on its own:
   created under `C:\tmp`.
 - **Capture, so an error cannot strand the wait.** The sentinel rides the
   prompt-return edge, and a form parked in SLDB never returns the prompt — so
-  the bare `my/slime-send-then-touch` blocks until a human aborts the debugger.
+  on that edge alone the wait would block until a human aborts the debugger.
   `my/slime-send-capturing-then-touch` keeps the error in the REPL (condition,
   backtrace, return value `:error`), so the prompt always comes back and step 4
-  shows what happened.
+  shows what happened. The guard covers *reading* as well as evaluating, which
+  is what makes it hold for the commonest case of all — a form naming a package
+  the image does not have yet (see [Compilation policy and catching
+  errors](#compilation-policy-and-catching-errors)).
+- **An SLDB net under the capture.** Capture handles `error` conditions; a C-c
+  interrupt or a non-`error` `serious-condition` still opens the debugger. So
+  `my/slime-send-then-touch` also arms a one-shot on `sldb-hook` that writes
+  `(:done nil :sldb t :elapsed-ms … )`. The wait therefore always ends, with a
+  verdict that says which way it ended — **test `:done`**, not the existence of
+  the file. Whichever one-shot fires first disarms the other, so the verdict
+  records the first thing that happened and a later abort cannot rewrite it.
 
 `my/slime-send-wait` is the wrong tool here in a different way: it does the
 waiting *inside* Emacs (`sleep-for`), queueing the user's keystrokes and making
@@ -681,6 +698,36 @@ and conditions that are not `error` subtypes, still reach SLDB as usual. For the
 richest backtrace, raise the debug policy (above) before you recompile the code
 under test.
 
+**The guard has to cover `read`, not just `eval`.** Splicing the form straight
+into the wrapper protects it from evaluation-time errors only: the `handler-bind`
+is part of the very form being read, so it is not established yet while the
+reader is still parsing. The classic casualty is a form naming a package that
+does not exist in the image yet — `(my-system::+some-constant+)` before the
+system is loaded. That is `SB-INT:SIMPLE-READER-PACKAGE-ERROR`, signalled during
+`read`, and it used to park in SLDB *past* a guard that never got a chance to
+run — with the sentinel variant, that meant a wait that never ended and a REPL
+whose `my/slime-repl-status` looked perfectly normal (`:busy nil`, a healthy
+prompt in `:tail`) apart from `:in-debugger t`. So the form now travels to the
+image as a **string** and the wrapper reads it itself, inside the guard:
+
+```lisp
+(block my/slime--capture
+  (handler-bind ((error (lambda (c) … (return-from my/slime--capture :error))))
+    (with-input-from-string (my/s "(my-system::+some-constant+)")
+      … (eval (read my/s nil eof)) …)))       ; ← read happens INSIDE the guard
+```
+
+Reader errors — a missing package, a stray paren — therefore self-report exactly
+like evaluation errors, and `my/slime-send-timed` gets the same treatment. Three
+consequences worth knowing:
+
+- forms are read and evaluated **one at a time**, as the REPL listener does, so
+  a leading `(in-package …)` still governs how the following forms are read;
+- the REPL echo shows the form inside a string literal, with embedded quotes
+  backslashed — cosmetically noisier, still perfectly legible in the scrollback;
+- the form is evaluated by `eval` in the null lexical environment, which is what
+  the toplevel prompt does anyway.
+
 > **`my/slime-busy-p` does not see SLDB — poll `my/slime-ready-p` instead.**
 > This is the single most misleading thing about the polling workflow, so it is
 > worth stating precisely. SLIME's own `slime-busy-p` is documented *"True if
@@ -710,12 +757,14 @@ under test.
 >
 > Two related consequences: `my/slime-send-wait` returns an explicit
 > `[SLDB -- evaluation parked in the debugger]` marker rather than pretending the
-> form completed; and `my/slime-send-then-touch` *does* block indefinitely on an
-> SLDB park, because it rides the prompt-return edge, which a debugged form never
-> reaches until you abort. That sentinel file is the one place where "waits
-> forever" is the true failure mode — which is why the long-running recipe sends
-> with `my/slime-send-capturing-then-touch` (no SLDB park, so the prompt always
-> returns) *and* bounds the shell wait.
+> form completed; and `my/slime-send-then-touch`, which rides the prompt-return
+> edge that a debugged form never reaches, would block forever on an SLDB park —
+> so it arms a second one-shot on `sldb-hook` and writes `(:done nil :sldb t …)`
+> instead. The wait ends either way; what it must not do is *lie*, so read
+> `:done` rather than treating the file as a success flag. The long-running
+> recipe still sends with `my/slime-send-capturing-then-touch`, because ending
+> the wait with `:sldb t` leaves the image parked at a debugger prompt, whereas
+> capturing keeps it running to a real prompt.
 
 ### Interrupt a hang, then read the backtrace
 
@@ -723,6 +772,9 @@ under test.
 errors: interrupting it (`my/slime-interrupt`, = `C-c C-c`) raises
 `sb-sys:interactive-interrupt`, which is a `serious-condition` but **not** an
 `error`, so no `handler-bind` on `error` catches it — it always drops into SLDB.
+This is the case the sentinel's `sldb-hook` net exists for: if a sentinel was
+armed for the form, the interrupt writes `(:done nil :sldb t …)` and whoever is
+blocked on the file learns where the form went instead of waiting forever.
 And once the connection sits in SLDB, `my/slime-busy-p` reads `nil` (see the box
 above), so a shell poll loop concludes the REPL is free while it is in fact
 parked at a debugger prompt. Three helpers reach the debugger buffer that the
@@ -992,9 +1044,9 @@ while [ ! -e "$SENT_S" ] && [ "$SECONDS" -lt "$END" ]; do sleep 2; done
 cat "$SENT_S.out"
 ```
 
-Your shell commands have a per-command timeout (Claude Code's Bash tool caps at 10 minutes), so a `for i in $(seq 1 100); do sleep 6; ...ready-p...; done` watch gets killed mid-watch: you stop watching without noticing and report nothing. The blocking wait above is far cheaper, bounded, and resumable — on STILL-RUNNING, say so and run the same wait block again rather than concluding nothing happened. Use `my/slime-send-capturing-then-touch` rather than the bare `my/slime-send-then-touch`, because a form that errors into SLDB never returns the prompt and so never touches the sentinel.
+Your shell commands have a per-command timeout (Claude Code's Bash tool caps at 10 minutes), so a `for i in $(seq 1 100); do sleep 6; ...ready-p...; done` watch gets killed mid-watch: you stop watching without noticing and report nothing. The blocking wait above is far cheaper, bounded, and resumable — on STILL-RUNNING, say so and run the same wait block again rather than concluding nothing happened. Use `my/slime-send-capturing-then-touch` rather than the bare `my/slime-send-then-touch`, because a form that errors into SLDB never returns the prompt; capturing keeps it running to a real prompt. The capture covers read-time errors too — a form naming a package the image does not have yet, such as `(my-system::+some-constant+)` before the system is loaded.
 
-The sentinel is not empty: it holds one line, e.g. `(:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)`. Read it before distrusting a *fast* return — `:prompt-returns 1` plus output means the form genuinely finished (a warm fasl cache is fast, and that is fine); `:suspect t` means the prompt was redrawn more than once while the sentinel was armed, so check `(my/slime-repl-status)` before believing it.
+The sentinel is not empty: it holds one line, e.g. `(:done t :elapsed-ms 8021 :prompt-returns 1 :output-chars 18422 :suspect nil)`. Read it before distrusting a *fast* return — `:prompt-returns 1` plus output means the form genuinely finished (a warm fasl cache is fast, and that is fine); `:suspect t` means the prompt was redrawn more than once while the sentinel was armed, so check `(my/slime-repl-status)` before believing it. Test `:done`, not the file's existence: a form that reaches SLDB anyway (a `C-c` interrupt, a condition that is not an `error`) ends the wait through the `sldb-hook` net, which writes `(:done nil :sldb t …)` — the image is then parked in the debugger, so read `my/slime-sldb-backtrace-to-file` and `my/slime-sldb-abort`.
 
 When you do poll, poll `my/slime-ready-p`, not `my/slime-busy-p`: the latter reports a form parked in SLDB as idle, so it cannot see an open debugger and would have you read an errored form as a finished one.
 
