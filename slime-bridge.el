@@ -17,6 +17,12 @@
 ;; you call emacsclient from WSL.  `my/slime-host-info' reports which one you
 ;; reached, so a dual-target driver can state its target and pick the path rules.
 ;;
+;; Load order does not matter: this file may be loaded before SLIME is started.
+;; The prompt hook the `*-then-touch' sentinels ride on is (re)installed when
+;; SLIME loads AND every time a sentinel is armed.  `my/slime-host-info' and
+;; `my/slime-repl-status' report `:touch-armed' if you want to confirm it before
+;; blocking a shell on a sentinel file.
+;;
 ;; Three rules this file enforces:
 ;;
 ;;   * Never steal the user's window. The REPL is surfaced only when it is not
@@ -540,7 +546,13 @@ Emacs PROCESS that `emacsclient' reached, which is what decides the path rules:
     shell all share the same plain paths; no translation.
 
 Call it right after loading this file -- before `M-x slime-connect' even -- to
-confirm and announce which target you are driving."
+confirm and announce which target you are driving.
+
+`:touch-armed' says whether the `*-then-touch' sentinel machinery can fire (see
+`my/slime-touch-armed-p').  It reads nil until SLIME's REPL is loaded, which is
+fine -- arming a sentinel installs the hook itself.  `:touch-armed' nil together
+with `:slime-connected' t is the state to act on: sentinels would never appear,
+so reload this file rather than starting a wait."
   (let ((win (memq system-type '(windows-nt ms-dos cygwin))))
     (list :emacs-system-type system-type
           :windows-emacs (and win t)
@@ -548,7 +560,8 @@ confirm and announce which target you are driving."
           :emacs-version emacs-version
           :slime-loaded (and (featurep 'slime) t)
           :slime-connected (and (fboundp 'slime-connected-p)
-                                (ignore-errors (slime-connected-p)) t))))
+                                (ignore-errors (slime-connected-p)) t)
+          :touch-armed (my/slime-touch-armed-p))))
 
 (defun my/slime-repl-status ()
   "One-call summary: target, connection, REPL buffer, package, busy state, tail.
@@ -556,12 +569,16 @@ confirm and announce which target you are driving."
 is answering -- see `my/slime-host-info' -- so the caller can pick path rules
 even from this single call.  `:can-restart' says whether Emacs started this
 image itself and can therefore restart it (`my/slime-restart-and-wait'); it is
-nil for an image reached with `M-x slime-connect'."
+nil for an image reached with `M-x slime-connect'.  `:touch-armed' is the
+precondition for the `*-then-touch' sentinels -- nil there while `:connected'
+is t means a wait on a sentinel file would never end (see
+`my/slime-touch-armed-p')."
   (if (not (and (fboundp 'slime-connected-p) (slime-connected-p)))
       (list :connected nil
             :emacs-system-type system-type
             :path-style (if (memq system-type '(windows-nt ms-dos cygwin))
-                            'windows 'unix))
+                            'windows 'unix)
+            :touch-armed (my/slime-touch-armed-p))
     (list :connected t
           :emacs-system-type system-type
           :path-style (if (memq system-type '(windows-nt ms-dos cygwin))
@@ -571,6 +588,7 @@ nil for an image reached with `M-x slime-connect'."
           :busy (and (my/slime-busy-p) t)
           :in-debugger (and (my/slime-sldb-buffer) t)
           :can-restart (and (ignore-errors (slime-inferior-process)) t)
+          :touch-armed (my/slime-touch-armed-p)
           :visible (and (get-buffer-window (slime-output-buffer) 0) t)
           :pending-input (my/slime-pending-input)
           :tail (string-trim (my/slime-repl-tail 200)))))
@@ -640,16 +658,63 @@ signals, so it cannot alter or break prompt insertion.  Bumps
       (run-hooks 'my/slime-repl-idle-functions)))
   nil)
 
-(when (fboundp 'slime-repl-insert-prompt)
-  ;; `advice-add' de-duplicates by function symbol, so reloading this file does
-  ;; not stack the advice.
-  (advice-add 'slime-repl-insert-prompt :after #'my/slime--run-idle-functions))
+(defun my/slime--ensure-idle-advice ()
+  "Put the idle advice on `slime-repl-insert-prompt'; return non-nil once it is.
+Returns nil only while that function is still undefined -- i.e. in an Emacs
+where SLIME (strictly: its REPL contrib) has not been loaded yet.
+
+Called at load time, again when SLIME loads, and ONCE MORE EVERY TIME A
+SENTINEL IS ARMED, so the order in which this file and SLIME are loaded does
+not matter.  It used to matter, silently: the advice was installed only if
+`slime-repl-insert-prompt' happened to be defined when this file was read, so
+loading the bridge into a SLIME-less Emacs left every `*-then-touch' sentinel
+dead for the life of that Emacs -- forms really ran, \"sent\" really came back,
+and the file simply never appeared, costing each waiter its whole timeout.
+Resolving the advice at arm time instead of at load time is what removes that
+failure mode; `my/slime-touch-armed-p' is how a driver checks it.
+
+`advice-add' de-duplicates by function symbol, and this checks `advice-member-p'
+besides, so repeated calls and reloads of this file cannot stack the advice."
+  (and (fboundp 'slime-repl-insert-prompt)
+       (progn
+         (unless (advice-member-p #'my/slime--run-idle-functions
+                                  'slime-repl-insert-prompt)
+           (advice-add 'slime-repl-insert-prompt :after
+                       #'my/slime--run-idle-functions))
+         t)))
+
+(defun my/slime-touch-armed-p ()
+  "Return t when the `*-then-touch' sentinel machinery can actually fire.
+That is: `slime-repl-insert-prompt' exists and carries the idle advice.  This
+only REPORTS -- `my/slime--ensure-idle-advice' is what installs it -- so it is
+safe to call as a precondition check.
+
+nil BEFORE SLIME's REPL is loaded is expected and harmless: arming a sentinel
+installs the advice on the spot.  nil while `my/slime-host-info' says
+`:slime-connected t' is the red flag -- something removed the advice, and no
+sentinel will ever appear."
+  (and (fboundp 'slime-repl-insert-prompt)
+       (advice-member-p #'my/slime--run-idle-functions
+                        'slime-repl-insert-prompt)
+       t))
+
+;; Install now if SLIME is already here, and again when it -- or the REPL
+;; contrib, which is where `slime-repl-insert-prompt' actually lives -- loads
+;; later.  Neither is load-bearing on its own: arming a sentinel calls
+;; `my/slime--ensure-idle-advice' too, which is the guarantee that matters.
+(my/slime--ensure-idle-advice)
+(with-eval-after-load 'slime (my/slime--ensure-idle-advice))
+(with-eval-after-load 'slime-repl (my/slime--ensure-idle-advice))
 
 (defun my/slime-run-once-when-idle (fn)
   "Arrange for FN (no arguments) to run once, the next time the REPL is idle.
 Returns the internal hook entry, so a caller that decides not to wait can pass
 it to `remove-hook' on `my/slime-repl-idle-functions'.  The entry removes
-itself before calling FN, so a re-entrant FN cannot re-trigger it."
+itself before calling FN, so a re-entrant FN cannot re-trigger it.
+
+Installs the prompt advice first (`my/slime--ensure-idle-advice'), so a one-shot
+armed in an Emacs that loaded this file before SLIME still fires."
+  (my/slime--ensure-idle-advice)
   (letrec ((entry (lambda ()
                     (remove-hook 'my/slime-repl-idle-functions entry)
                     (funcall fn))))
@@ -744,42 +809,56 @@ would also end the wait -- it says `:sldb t', which is honest either way.)
 
 Prefer `my/slime-send-capturing-then-touch': ending the wait with `:sldb t'
 still leaves the image parked in the debugger, whereas capturing keeps the form
-running to a real prompt."
-  (when (file-exists-p path)
-    (delete-file path))
-  (let* ((armed-at (float-time))
-         (armed-prompts my/slime--prompt-inserts)
-         ;; Reset to the post-send position below, so the echoed input form
-         ;; itself is not counted as output.
-         (start-pos (with-current-buffer (my/slime-assert-connected) (point-max)))
-         idle-entry sldb-entry)
-    (letrec ((disarm (lambda ()
-                       (remove-hook 'my/slime-repl-idle-functions idle-entry)
-                       (remove-hook 'sldb-hook sldb-entry)))
-             (fire (lambda (sldb)
-                     (funcall disarm)
-                     (my/slime--write-sentinel path armed-at armed-prompts
-                                               start-pos sldb))))
-      (setq idle-entry (lambda () (funcall fire nil))
-            ;; Runs inside `sldb-setup', with the SLDB buffer current; demote
-            ;; errors so a failure here cannot break the debugger buffer.
-            sldb-entry (lambda ()
-                         (with-demoted-errors "my/slime sldb sentinel error: %S"
-                           (funcall fire t))))
-      (add-hook 'my/slime-repl-idle-functions idle-entry)
-      (add-hook 'sldb-hook sldb-entry)
-      (condition-case err
-          (progn
-            (my/slime-send code force)
-            ;; No process output can arrive between the send and this setq --
-            ;; nothing here yields to the filter -- so the one-shot cannot fire
-            ;; with the stale position.
-            (setq start-pos
-                  (with-current-buffer (slime-output-buffer) (point-max))))
-        (error
-         (funcall disarm)
-         (signal (car err) (cdr err))))))
-  "sent")
+running to a real prompt.
+
+The prompt advice the sentinel rides on is installed HERE, at arm time, not at
+this file's load time, so loading the bridge before SLIME no longer breaks the
+sentinel.  In the one case where it still cannot be installed -- no
+`slime-repl-insert-prompt' at all, so no prompt-return edge to observe -- CODE
+is NOT sent and the return value is an `*ERROR*' string instead of \"sent\".
+That is deliberate: a cheerful \"sent\" with no sentinel behind it is invisible
+to the driver, which then blocks for its full timeout on a file that can never
+appear."
+  (if (not (my/slime--ensure-idle-advice))
+      (concat "*ERROR* sentinel not armed: `slime-repl-insert-prompt' is"
+              " undefined (SLIME REPL not loaded), so the prompt-return edge"
+              " cannot be observed; nothing was sent")
+    (when (file-exists-p path)
+      (delete-file path))
+    (let* ((armed-at (float-time))
+           (armed-prompts my/slime--prompt-inserts)
+           ;; Reset to the post-send position below, so the echoed input form
+           ;; itself is not counted as output.
+           (start-pos (with-current-buffer (my/slime-assert-connected)
+                        (point-max)))
+           idle-entry sldb-entry)
+      (letrec ((disarm (lambda ()
+                         (remove-hook 'my/slime-repl-idle-functions idle-entry)
+                         (remove-hook 'sldb-hook sldb-entry)))
+               (fire (lambda (sldb)
+                       (funcall disarm)
+                       (my/slime--write-sentinel path armed-at armed-prompts
+                                                 start-pos sldb))))
+        (setq idle-entry (lambda () (funcall fire nil))
+              ;; Runs inside `sldb-setup', with the SLDB buffer current; demote
+              ;; errors so a failure here cannot break the debugger buffer.
+              sldb-entry (lambda ()
+                           (with-demoted-errors "my/slime sldb sentinel error: %S"
+                             (funcall fire t))))
+        (add-hook 'my/slime-repl-idle-functions idle-entry)
+        (add-hook 'sldb-hook sldb-entry)
+        (condition-case err
+            (progn
+              (my/slime-send code force)
+              ;; No process output can arrive between the send and this setq --
+              ;; nothing here yields to the filter -- so the one-shot cannot
+              ;; fire with the stale position.
+              (setq start-pos
+                    (with-current-buffer (slime-output-buffer) (point-max))))
+          (error
+           (funcall disarm)
+           (signal (car err) (cdr err))))))
+    "sent"))
 
 (defun my/slime-send-capturing-then-touch (path code &optional n-frames force)
   "Send CODE so that errors stay in the REPL and PATH is touched when it is done.

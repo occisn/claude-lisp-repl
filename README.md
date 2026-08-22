@@ -140,6 +140,8 @@ Helper functions for staging, sending, waiting for the prompt and reading output
 emacsclient --eval '(load-file "/path/to/claude-lisp-repl/slime-bridge.el")'
 ```
 
+Load order does not matter — the file may be loaded before SLIME is started, and the prompt hook the `…-then-touch` sentinels ride on is installed when SLIME loads and again every time a sentinel is armed. `(my/slime-host-info)` and `(my/slime-repl-status)` report `:touch-armed` if you want to confirm it: `nil` before SLIME's REPL exists is normal, `nil` while `:slime-connected`/`:connected` is `t` means no sentinel would ever appear (reload the file).
+
 Then:
 
 | Need | Call |
@@ -332,7 +334,9 @@ The native target needs **no translation at all** — Emacs, the image, and the 
 [`slime-bridge.el`](slime-bridge.el) provides the elisp used by the main recipe
 and Annex B. Load it once per Emacs session via `emacsclient`; it needs SLIME
 connected (except `my/slime-host-info`, which reports the target even before you
-connect).
+connect). Loading it before SLIME is started is fine — the sentinel machinery
+resolves itself at send time, and `:touch-armed` in `my/slime-host-info` /
+`my/slime-repl-status` says whether it is live.
 
 Everything is in that one file — there is no second copy to drift out of sync
 — so you can either have Claude `load-file` it as shown in each recipe, or
