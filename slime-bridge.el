@@ -888,6 +888,68 @@ test `:done' in the sentinel rather than treating its existence as success."
   (my/slime-send-then-touch path (my/slime--capture-wrap code n-frames) force))
 
 ;;; ---------------------------------------------------------------------------
+;;; Compiling one file into the image
+;;;
+;;; `asdf:load-system' stats every component even when nothing changed; on a
+;;; big system on /mnt/c that alone can cost tens of seconds, so an edit-and-
+;;; retest loop ends up dominated by timestamp checks.  Compiling just the
+;;; edited file is instant, but the two obvious ways of doing it are traps:
+;;;
+;;;   * SLIME's C-c C-k lets SWANK pick the fasl path, which by default is
+;;;     `compile-file-pathname' -- the fasl lands NEXT TO THE SOURCE and they
+;;;     accumulate across the tree.  So the fasl goes to the temp directory.
+;;;   * A bare COMPILE-FILE inherits whatever policy was proclaimed LAST, and an
+;;;     .asd `:around-compile (proclaim ...)' leaves its policy behind.  So the
+;;;     policy is stated with `with-compilation-unit (:policy ...)', which SBCL
+;;;     binds for the unit and restores afterwards (nested units included).
+;;; ---------------------------------------------------------------------------
+
+(defun my/slime--compile-file-form (path policy)
+  "Return a Lisp form that compiles PATH under POLICY into a temp fasl and loads it.
+POLICY is the body of an `optimize' declaration as a string, e.g.
+\"(speed 3) (safety 0) (debug 0)\".  A COMPILE-FILE whose FAILURE-P is true
+signals an error instead of loading -- the same stance ASDF takes on SBCL -- so
+under the capture wrapper a broken file self-reports.  Returns LOAD's value."
+  (format
+   (concat "(let ((my/src (pathname %s))\n"
+           "      (my/fasl (merge-pathnames \"claude-one-file.fasl\" (uiop:temporary-directory))))\n"
+           "  (multiple-value-bind (my/out my/warn my/fail)\n"
+           "      (with-compilation-unit (:policy '(optimize %s))\n"
+           "        (compile-file my/src :output-file my/fasl))\n"
+           "    (declare (ignore my/warn))\n"
+           "    (when (or (null my/out) my/fail)\n"
+           "      (error \"COMPILE-FILE of ~a failed -- not loaded; see the compiler output above\" my/src))\n"
+           "    (load my/out)))")
+   (my/slime--lisp-string path) policy))
+
+(defun my/slime-compile-file-to-temp (path &optional policy sentinel-path n-frames force)
+  "Compile the single file PATH into the image, with a stated POLICY, via the REPL.
+The fast alternative to `asdf:load-system' after editing one file: the fasl goes
+to `uiop:temporary-directory' (never next to the source, unlike C-c C-k), and
+the policy is bound with `with-compilation-unit (:policy ...)' rather than
+inherited from whatever was proclaimed last.
+
+PATH is the file as the IMAGE sees it -- a Windows path for a Windows SBCL.
+POLICY is an `optimize' body as a string; pass the .asd's own policy to get the
+code ASDF would build.  It defaults to SBCL's default of 1 for every quality, so
+the result never depends on history.
+
+Sent through the capture wrapper, so a compile failure or load error prints
+\"; CONDITION ...\" and returns `:error' instead of opening SLDB.  With
+SENTINEL-PATH it goes through `my/slime-send-capturing-then-touch' so the shell
+can block on it; otherwise through `my/slime-send-capturing'.  Returns \"sent\".
+
+Afterwards: the next `asdf:load-system' recompiles this file once (ASDF's fasl is
+now older than the source).  And if the file registers things by PUSHing onto a
+registry, reloading it registers them twice -- re-run whatever de-duplicates or
+finalizes that registry."
+  (let ((code (my/slime--compile-file-form
+               path (or policy "(speed 1) (safety 1) (debug 1) (space 1) (compilation-speed 1)"))))
+    (if sentinel-path
+        (my/slime-send-capturing-then-touch sentinel-path code n-frames force)
+      (my/slime-send-capturing code n-frames force))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Restarting the image
 ;;;
 ;;; A stale image lies: `defstruct'/`defclass' slot changes leave old accessors

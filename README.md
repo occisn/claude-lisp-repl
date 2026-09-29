@@ -157,6 +157,7 @@ Then:
 | **slow work (system load, test run) — the default shape** | `(my/slime-mark)`, `(my/slime-send-capturing-then-touch "/tmp/done" "FORM")`, block on `/tmp/done` from the shell, `cat` it to see how it fired, then `(my/slime-output-since-mark-to-file "/tmp/done.out")` — the recipe above |
 | short form: send and check | `(my/slime-mark)`, `(my/slime-send "FORM")`, a few `(my/slime-ready-p)` polls, `(my/slime-output-since-mark)` |
 | sentinel *without* the error capture (rarely what you want) | `(my/slime-send-then-touch "/tmp/done" "FORM")` |
+| recompile ONE edited file into the image (skips `asdf:load-system`'s timestamp sweep) | `(my/slime-compile-file-to-temp "/path/src/f.lisp" "(speed 3) (safety 0)" "/tmp/done")` — see [Compile one file into the image](#compile-one-file-into-the-image) |
 | restart the image, wait for the new REPL, re-load | `(my/slime-restart-and-wait 60 "(asdf:load-system :sys)" "/tmp/done")` |
 | submit + wait, output to a file (dodges the reply-size/escaping limit) | `(my/slime-send-wait-to-file "/tmp/out.txt" "FORM" TIMEOUT)` |
 | output to a file rather than through `--eval` | `(my/slime-output-since-mark-to-file "/tmp/out.txt")`, `(my/slime-repl-tail-to-file ...)` |
@@ -681,6 +682,63 @@ clamps the *effective* policy after the code's own declarations, so a stray
 can't promise. Undo them later with `(sb-ext:restrict-compiler-policy 'debug 0)`
 and `(sb-ext:restrict-compiler-policy 'speed 0 3)` (max back to 3).
 
+### Compile one file into the image
+
+On a large system `asdf:load-system` is slow **even when nothing changed**: ASDF
+stats every component, and on a tree under `/mnt/c` each stat crosses the
+WSL-to-Windows bridge. In one 2,300-file system that cost 20–25 s per reload,
+against ~0.1 s to compile the single file that was edited, so the edit-and-retest
+loop was spent on timestamp checks. Compiling just that file is the fix, but the
+two obvious ways of doing it are traps:
+
+1. **`C-c C-k` scatters fasls.** SWANK's `fasl-pathname` falls back to
+   `compile-file-pathname` when `swank:*fasl-pathname-function*` is `nil` (the
+   default), so the fasl lands **next to the source**. A `*.fasl` gitignore line
+   hides them from git, but they accumulate across the tree (and get synced, on
+   a Dropbox tree). Give `compile-file` an `:output-file` in the temp directory.
+2. **A bare `compile-file` inherits whatever policy was proclaimed *last*.**
+   `proclaim` is global and permanent, and an `.asd` `:around-compile` that
+   proclaims `(optimize …)` leaves it set. After loading a test system at
+   `(safety 3)`, or the main system at `(safety 0)`, the next hand compile
+   silently gets that policy. State the policy with `with-compilation-unit
+   (:policy …)`: SBCL binds it for the unit and restores the global one
+   afterwards, nested units included.
+
+```lisp
+(let ((src  #p"/path/to/src/some-file.lisp")
+      (fasl (merge-pathnames "one.fasl" (uiop:temporary-directory))))
+  (with-compilation-unit (:policy '(optimize (speed 3) (safety 0) (debug 0))) ; = the .asd's
+    (load (compile-file src :output-file fasl))))
+```
+
+`my/slime-compile-file-to-temp` sends exactly this through the capture wrapper,
+so a compile failure self-reports like any other error. It also refuses to load a
+fasl whose `compile-file` returned *failure-p*, which is what ASDF does on SBCL:
+
+```elisp
+(my/slime-compile-file-to-temp "/path/to/src/some-file.lisp"
+                               "(speed 3) (safety 0) (debug 0)")   ; the .asd's policy
+(my/slime-compile-file-to-temp "/path/…" "(speed 3) (safety 0)" "/tmp/done") ; + sentinel
+```
+
+The path is as the **image** sees it: a Windows path for a Windows SBCL. With no
+policy it compiles at SBCL's default (1 for every quality), not at whatever was
+proclaimed last. Pass the `.asd`'s policy to get the code ASDF would build. Two
+side effects:
+
+- **The next `asdf:load-system` recompiles that file once**, because ASDF's own
+  fasl is now older than the source. That is one file, not a rebuild.
+- **Registries that grow by `push` get duplicates.** If the file registers
+  entities by pushing them onto a list, reloading it registers them a second
+  time. Re-run whatever de-duplicates or finalizes that registry afterwards, or
+  a registry-integrity check will fail for reasons unrelated to your edit.
+
+**Scratch probes compile under the global policy too.** A scratch `.lisp` file
+you `load` into the image is compiled under whatever is proclaimed. At
+`(safety 0)` a typo in the probe, such as an unbound variable, can produce
+`Unhandled memory fault`, which at first looks like a bug in the code under
+test. Start every scratch probe with `(declaim (optimize (safety 3)))`.
+
 ### Catch errors instead of dropping into SLDB
 
 When a form errors, SLIME opens an **SLDB** debugger buffer and the evaluation
@@ -733,6 +791,13 @@ consequences worth knowing:
   backslashed — cosmetically noisier, still perfectly legible in the scrollback;
 - the form is evaluated by `eval` in the null lexical environment, which is what
   the toplevel prompt does anyway.
+- but **each form is read whole before it runs**. So `(progn
+  (asdf:load-system :x) (x:new-fn …))` fails with
+  `SIMPLE-READER-PACKAGE-ERROR` when `new-fn` is exported *by that very load*:
+  the reader meets `x:new-fn` before the load has run. The capture reports it
+  correctly. The fix is to **load in one form and call in the next**, either as
+  two sends or as two top-level forms in one send, since those are read one at
+  a time.
 
 > **`my/slime-busy-p` does not see SLDB — poll `my/slime-ready-p` instead.**
 > This is the single most misleading thing about the polling workflow, so it is
