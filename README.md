@@ -732,6 +732,26 @@ side effects:
   entities by pushing them onto a list, reloading it registers them a second
   time. Re-run whatever de-duplicates or finalizes that registry afterwards, or
   a registry-integrity check will fail for reasons unrelated to your edit.
+- **A file that *defines* a registry empties it.** This is the reverse case, and
+  it is worse. Reloading the file re-runs its top-level `(defparameter +registry+
+  nil)`, which resets the list in the live image. The entity files that push
+  into it are not reloaded, so nothing refills it, and nothing reports it either:
+  the next caller just gets an empty list. Under `(safety 0)` it can go further
+  wrong. A `(first +registry+)` that is now `NIL`, passed to a function that
+  declares its argument a struct, reads unrelated memory as that struct, and the
+  failure shows up later and somewhere else, or never. In one session it first
+  showed as an argument-count error from `(reduce #'max nil)`, then as a
+  `TYPE-ERROR` whose datum was the number `70383776563200`. Switching to
+  `defvar` does not fix it: a reloaded `defvar` keeps stale entries that were
+  deleted from the source. **Never compile a single file that defines a global
+  with `defparameter` into a long-lived image.** Restart and `load-system`
+  instead, and treat an image that has already done it as suspect.
+  `my/slime-compile-file-to-temp` enforces this. It scans the file for
+  top-level `(defparameter` forms and refuses with a `user-error` naming them,
+  without sending anything. Pass a non-nil 6th argument, `ALLOW-DEFPARAMETER`,
+  when resetting them is harmless, for example a constant-like tuning parameter.
+  The scan needs Emacs to be able to read the path. When it cannot, for example
+  a path only the image can see, the file is compiled without the check.
 
 **Scratch probes compile under the global policy too.** A scratch `.lisp` file
 you `load` into the image is compiled under whatever is proclaimed. At

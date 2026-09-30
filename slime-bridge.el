@@ -922,7 +922,22 @@ under the capture wrapper a broken file self-reports.  Returns LOAD's value."
            "    (load my/out)))")
    (my/slime--lisp-string path) policy))
 
-(defun my/slime-compile-file-to-temp (path &optional policy sentinel-path n-frames force)
+(defun my/slime--toplevel-defparameters (path)
+  "Return the names of the globals PATH defines with a top-level `defparameter'.
+Only forms starting in column 0 count.  Returns nil when Emacs cannot read PATH
+\(e.g. a path only the image can see), in which case nothing was checked."
+  (when (file-readable-p path)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (let ((case-fold-search t) names)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^(defparameter[ \t\n]+\\([^ \t\n()]+\\)" nil t)
+          (push (match-string-no-properties 1) names))
+        (nreverse names)))))
+
+(defun my/slime-compile-file-to-temp (path &optional policy sentinel-path n-frames force
+                                           allow-defparameter)
   "Compile the single file PATH into the image, with a stated POLICY, via the REPL.
 The fast alternative to `asdf:load-system' after editing one file: the fasl goes
 to `uiop:temporary-directory' (never next to the source, unlike C-c C-k), and
@@ -942,7 +957,20 @@ can block on it; otherwise through `my/slime-send-capturing'.  Returns \"sent\".
 Afterwards: the next `asdf:load-system' recompiles this file once (ASDF's fasl is
 now older than the source).  And if the file registers things by PUSHing onto a
 registry, reloading it registers them twice -- re-run whatever de-duplicates or
-finalizes that registry."
+finalizes that registry.
+
+Refuses -- a `user-error', nothing sent -- when PATH has a top-level
+`defparameter', naming the globals: reloading the file re-runs it and resets
+that global in the live image, while the other files that filled it are not
+reloaded, so e.g. a registry silently becomes empty.  Restart and
+`asdf:load-system' instead.  Pass ALLOW-DEFPARAMETER non-nil when the reset is
+harmless (a constant-like parameter).  The scan needs Emacs to read PATH; when
+it cannot, the file is compiled unchecked."
+  (let ((globals (and (not allow-defparameter)
+                      (my/slime--toplevel-defparameters path))))
+    (when globals
+      (user-error "%s defines %s with defparameter; reloading it resets them in the image.  Restart and load-system instead, or pass ALLOW-DEFPARAMETER"
+                  path (mapconcat #'identity globals ", "))))
   (let ((code (my/slime--compile-file-form
                path (or policy "(speed 1) (safety 1) (debug 1) (space 1) (compilation-speed 1)"))))
     (if sentinel-path
